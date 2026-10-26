@@ -12,7 +12,8 @@ type Node = {
   origin: "human" | "ai"
   children: Node[]
 }
-type SuggestionType = "extend" | "challenge" | "evidence"
+// revise replaces the point's wording; prose fills its body; the rest add new points beneath it.
+type SuggestionType = "revise" | "prose" | "extend" | "challenge" | "evidence"
 type Suggestion = {
   id: string
   type: SuggestionType
@@ -27,6 +28,7 @@ type Suggestion = {
   sourced: boolean
   status: "new" | "added" | "dismissed"
   addedChildren?: number[]
+  previous?: string // what a revise/prose replaced, for undo
 }
 type Batch = { id: string; nodeId: string; text: string; at: number; items: Suggestion[]; perspective?: string; bigPicture?: BigPicture | null; steer?: string; errors: Partial<Record<"ideas" | "evidence", string>> }
 type BigPicture = { status: string; diagnosis: string; nextMove: string; nextLabel: string }
@@ -347,9 +349,28 @@ export default function Workspace() {
       s ? { ...s, batches: s.batches.map((b) => (b.id === batchId ? { ...b, items: b.items.map((i) => (i.id === itemId ? { ...i, ...patch } : i)) } : b)) } : s,
     )
 
+  const setBatchText = (batchId: string, text: string) =>
+    setState((s) => (s ? { ...s, batches: s.batches.map((b) => (b.id === batchId ? { ...b, text } : b)) } : s))
+  const showProse = () => {
+    if (levelRef.current !== 3) {
+      setToast({ level: 3, from: levelRef.current, key: Date.now() })
+      setLevel(3)
+    }
+  }
+
   function accept(batch: Batch, item: Suggestion, childIndex?: number) {
-    if (!find(state!.outline, batch.nodeId)) return
-    if (item.type === "evidence") {
+    const target = find(state!.outline, batch.nodeId)
+    if (!target) return
+    if (item.type === "revise") {
+      edit(batch.nodeId, { text: item.statement })
+      // Keep this round of suggestions in place rather than re-suggesting for the new wording.
+      setBatchText(batch.id, item.statement.trim())
+      markItem(batch.id, item.id, { status: "added", previous: target.node.text })
+    } else if (item.type === "prose") {
+      edit(batch.nodeId, { body: item.statement })
+      markItem(batch.id, item.id, { status: "added", previous: target.node.body })
+      showProse()
+    } else if (item.type === "evidence") {
       addChildren(batch.nodeId, [mk(item.statement || item.title, "evidence", "ai", item.url ?? "")])
       markItem(batch.id, item.id, { status: "added" })
     } else if (item.children.length) {
@@ -361,6 +382,15 @@ export default function Workspace() {
       addChildren(batch.nodeId, [mk(item.statement || item.title, "point", "ai")])
       markItem(batch.id, item.id, { status: "added" })
     }
+  }
+
+  function undo(batch: Batch, item: Suggestion) {
+    if (item.previous === undefined) return
+    if (item.type === "revise") {
+      edit(batch.nodeId, { text: item.previous })
+      setBatchText(batch.id, item.previous.trim())
+    } else edit(batch.nodeId, { body: item.previous })
+    markItem(batch.id, item.id, { status: "new", previous: undefined })
   }
 
   function steer(nodeId: string, note: string, everywhere: boolean) {
@@ -597,7 +627,7 @@ export default function Workspace() {
                     )}
                   </div>
                   {latest && (
-                    <BatchView key={latest.id} goTo={goTo} batch={latest} pending={pending[sel.node.id]} isThesis={!!isThesis} stale={latest.text !== sel.node.text.trim()} onAccept={accept} onDismiss={(b, i) => markItem(b.id, i.id, { status: "dismissed" })} />
+                    <BatchView key={latest.id} goTo={goTo} batch={latest} pending={pending[sel.node.id]} isThesis={!!isThesis} stale={latest.text !== sel.node.text.trim()} onAccept={accept} onUndo={undo} onDismiss={(b, i) => markItem(b.id, i.id, { status: "dismissed" })} />
                   )}
                   <Steer
                     key={sel.node.id}
@@ -617,7 +647,7 @@ export default function Workspace() {
                           {earlier.map((b) => (
                             <div key={b.id} className="space-y-2 border-l border-stone-200 pl-3">
                               <p className="text-[11px] text-stone-400">For “{b.text.slice(0, 70)}{b.text.length > 70 ? "..." : ""}”</p>
-                              <BatchView batch={b} isThesis={!!isThesis} onAccept={accept} onDismiss={(bb, i) => markItem(bb.id, i.id, { status: "dismissed" })} />
+                              <BatchView batch={b} isThesis={!!isThesis} onAccept={accept} onUndo={undo} onDismiss={(bb, i) => markItem(bb.id, i.id, { status: "dismissed" })} />
                             </div>
                           ))}
                         </div>
@@ -649,7 +679,7 @@ export default function Workspace() {
 }
 
 function BatchView({
-  batch, pending, isThesis, stale, onAccept, onDismiss, goTo,
+  batch, pending, isThesis, stale, onAccept, onUndo, onDismiss, goTo,
 }: {
   batch: Batch
   goTo?: (label: string) => (() => void) | null
@@ -657,15 +687,15 @@ function BatchView({
   isThesis: boolean
   stale?: boolean
   onAccept: (b: Batch, i: Suggestion, childIndex?: number) => void
+  onUndo: (b: Batch, i: Suggestion) => void
   onDismiss: (b: Batch, i: Suggestion) => void
 }) {
-  const groups: { type: SuggestionType; label: string; loading?: boolean; error?: string }[] = [
-    { type: "extend", label: isThesis ? "Ways to build this" : "Strengthen", loading: pending?.ideas, error: batch.errors.ideas },
-    { type: "evidence", label: "Stories and examples", loading: pending?.evidence, error: batch.errors.evidence },
-    { type: "challenge", label: "Push back", loading: pending?.ideas },
-  ]
-  // Below the thesis, evidence is the main job, so it leads.
-  if (!isThesis) groups.unshift(groups.splice(1, 1)[0])
+  const g = (type: SuggestionType, label: string, kind: "ideas" | "evidence" = "ideas") => ({
+    type, label, loading: pending?.[kind], error: type === "challenge" || type === "prose" || type === "revise" ? undefined : batch.errors[kind],
+  })
+  const groups = isThesis
+    ? [g("revise", "Reword"), g("extend", "Ways to build this"), g("evidence", "Opening hooks", "evidence"), g("challenge", "Push back")]
+    : [g("revise", "Reword"), g("prose", "Say it"), g("evidence", "Stories and examples", "evidence"), g("extend", "Next step"), g("challenge", "Push back")]
   return (
     <div className="space-y-5">
       {batch.steer && <p className="text-[11px] text-stone-400">Steered by “{batch.steer}”</p>}
@@ -687,7 +717,7 @@ function BatchView({
             {g.error && <p className="text-xs text-red-700">{g.error}</p>}
             <div className="space-y-0.5">
               {items.map((item) => (
-                <Item key={item.id} item={item} onAccept={(ci) => onAccept(batch, item, ci)} onDismiss={() => onDismiss(batch, item)} />
+                <Item key={item.id} item={item} onAccept={(ci) => onAccept(batch, item, ci)} onUndo={() => onUndo(batch, item)} onDismiss={() => onDismiss(batch, item)} />
               ))}
             </div>
           </section>
@@ -783,8 +813,38 @@ function Note({ text, everywhere, onRemove }: { text: string; everywhere?: boole
   )
 }
 
-function Item({ item, onAccept, onDismiss }: { item: Suggestion; onAccept: (childIndex?: number) => void; onDismiss: () => void }) {
+function Item({ item, onAccept, onUndo, onDismiss }: { item: Suggestion; onAccept: (childIndex?: number) => void; onUndo: () => void; onDismiss: () => void }) {
   const added = item.status === "added"
+  const [open, setOpen] = useState(false)
+  if (item.type === "revise" || item.type === "prose") {
+    const prose = item.type === "prose"
+    return (
+      <div className={`group -mx-2 rounded-lg px-2 py-1.5 transition-colors hover:bg-white ${added ? "bg-white/60" : ""}`}>
+        <div className="flex items-center gap-2">
+          <p className="flex-1 text-[11px] text-stone-400">{item.title}</p>
+          {added ? (
+            <span className="flex items-center gap-2 text-[11px] text-stone-400">
+              {prose ? "in draft" : "replaced"}
+              {item.previous !== undefined && <button onClick={onUndo} className="text-stone-600 underline-offset-2 hover:underline">Undo</button>}
+            </span>
+          ) : (
+            <div className="flex shrink-0 items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+              <IconBtn label="Dismiss" onClick={onDismiss}>×</IconBtn>
+              <button onClick={() => onAccept()} className="rounded-md bg-stone-900 px-2 py-0.5 text-[11px] text-white hover:bg-stone-700">
+                {prose ? "Use as prose" : "Replace mine"}
+              </button>
+            </div>
+          )}
+        </div>
+        <p
+          onClick={() => prose && setOpen(!open)}
+          className={prose ? `mt-0.5 cursor-pointer whitespace-pre-wrap font-serif text-[14px] leading-6 text-stone-700 ${open ? "" : "line-clamp-4"}` : "mt-0.5 text-[14px] leading-snug text-stone-900"}
+        >
+          {item.statement}
+        </p>
+      </div>
+    )
+  }
   return (
     <div className={`group -mx-2 rounded-lg px-2 py-1.5 transition-colors hover:bg-white ${added ? "opacity-50" : ""}`}>
       <div className="flex items-start gap-2">

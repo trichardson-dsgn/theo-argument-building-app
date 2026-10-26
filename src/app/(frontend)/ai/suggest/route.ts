@@ -15,14 +15,16 @@ type Input = {
 const SYSTEM = `You are a sharp thinking partner for someone developing a talk or essay. The human writes; you suggest. Be specific, concrete and brief. Never write the talk for them.
 Every suggestion has two voices:
 - "title" and "detail" speak TO the author as advice (e.g. "Define what you mean by...", "Show a case where...").
-- "statement" is the text as it would appear IN their outline: a declarative claim written in the author's voice, never an instruction or a question.
+- "statement" is the text as it would appear IN their outline, in the author's own voice: never an instruction or a question, and never prefixed with an outline label like "1.1:". Outline points are one sentence; only prose is longer.
+Voice for anything that goes into the outline: write like the author talks. Match their wording and register from what they have written. Plain words, short sentences, contractions, a bit of personality. No corporate or academic vocabulary (avoid words like leverage, foster, enhance, crucial, landscape, underscore, delve, navigate, robust, pivotal).
 The author is building ONE argument toward ONE thesis, for a talk or post of limited length. The shape of a strong piece:
 - one clear thesis;
 - 3-5 key points (level 1) that each move the audience one step closer to believing it, in an order that builds;
 - each key point earns its place with 1-2 vivid pieces of support (a story, example or striking fact);
-- sub-points (level 2) only where the reasoning needs one more step; they rarely need their own evidence;
-- almost nothing deeper than level 2. Depth is a cost: every extra layer is time the audience spends away from the thesis.
-Your job is to help the argument converge, not expand. Favour sharpening, connecting, reordering, merging and cutting over adding. When the author is deep in the outline, pull them back up. Write for a general audience: vivid, concrete, conversational, never academic.`
+- sub-points (level 2) where the reasoning needs another step; they need less evidence and more plain explanation;
+- prose under a point is how the author works out and justifies what they mean;
+- be wary of going deeper than level 2 or 3: depth is time the audience spends away from the thesis.
+Help the argument converge. Improving what is already written (rewording, explaining, justifying) is often more useful than adding new points. Write for a general audience: vivid, concrete, conversational, never academic.`
 
 const list = (v: unknown, n: number) =>
   Array.isArray(v) ? v.map((x) => String(x).slice(0, 500)).filter((x) => x.trim()).slice(-n) : []
@@ -70,6 +72,7 @@ function extractJson(text: string) {
 }
 
 const str = (v: unknown, n = 500) => String(v ?? "").slice(0, n)
+const unlabel = (t: string) => t.replace(/^\s*(THESIS|\d+(\.\d+)*)\s*(\[evidence\])?\s*:\s*/i, "")
 const norm = (u: string) => {
   try {
     const url = new URL(u)
@@ -81,22 +84,31 @@ const norm = (u: string) => {
 
 const PERSPECTIVE = `- "bigPicture": step back from the focused point and judge the WHOLE argument against the shape of a strong piece. {"status": one of "just starting" | "taking shape" | "too deep" | "drifting" | "gaps" | "strong", "diagnosis": one direct sentence on where the argument as a whole stands, "nextMove": the single most valuable next step for the whole piece (which may be somewhere other than the focused point, e.g. "Give key point 3 a story" or "Fold 2.1.1 into 2.1"), "nextLabel": the label of the point that next step is about (e.g. "3", "2.1", "THESIS")}. Do not praise; be an editor. If the focused point is deeper than level 2, or the outline goes deeper than level 2, name that in the diagnosis and use "too deep" unless key points are missing support.`
 
+const REVISE = (n: string) => `- "revise": ${n} rewrites of the focused text itself, each improving it in a different way (sharper, plainer, more specific, more surprising, closer to the thesis). "title" says in a few words what the rewrite changes (to the author), "statement" is the full replacement wording in the author's voice. Keep it about as short as theirs.`
+const PROSE = (n: string) => `- "prose": ${n} short drafts (50-110 words) of what the author would actually SAY to justify or explain this point, as spoken prose in their voice: conversational, concrete, one idea, the way you'd explain it to a friend. "title" names the approach (e.g. "Start from a familiar frustration"), "statement" is the prose. Not a summary, not a list; do not invent facts or statistics.`
+
 async function ideas(key: string, i: Input) {
   const task =
     i.level === "thesis"
       ? `Suggest:
 ${PERSPECTIVE}
+${REVISE("1-2")}
+- "prose": []
 - "extend": 3 distinctly different ways this thesis could become a talk or post. Each has a "title" naming the angle, a one-sentence "detail", and 3-5 "children" key points in order. Each child is {"suggestion": advice to the author about what this point should do, "statement": the key point written as a declarative claim}. Account for any key points already written.
 - "challenge": 2-3 ways a skeptic would push back, or where the thesis is vague, too broad or unearned. "title" is the challenge, "detail" why it matters, "statement" a key point that would answer it.`
       : i.depth === 1
         ? `This is a key point (one level below the thesis). Suggest:
 ${PERSPECTIVE}
-- "extend": 2-3 ways to make this key point land harder for the thesis: a sharper wording, the single best reason behind it, or a bridge into the next key point. Each has a "title" (advice), a one-sentence "detail", a "statement" (how it would read in the outline), and "children": [].
+${REVISE("1-2")}
+${PROSE("2")}
+- "extend": 2 sub-points that would make this key point land harder: the best reason behind it, or a bridge into the next key point. Each has a "title" (advice), a one-sentence "detail", a "statement" (how it would read in the outline), and "children": [].
 - "challenge": 1 objection an audience member would actually raise, with "title", "detail" and a "statement" that answers it.`
-        : `This point is already ${i.depth} levels below the thesis. Do NOT go deeper or open new sub-topics. Suggest:
-${PERSPECTIVE} If this point is a tangent or too deep, say so and suggest folding it upward.
-- "extend": 1-2 ways to tighten it or tie it back to its parent point and the thesis. Each has a "title" (advice), a one-sentence "detail", a "statement" (the tightened point), and "children": [].
-- "challenge": [] unless the point actively undermines the argument.`
+        : `This is a sub-point, ${i.depth} levels below the thesis. Help the author work out and say what they mean here rather than opening new sub-topics. Suggest:
+${PERSPECTIVE} If this point is a tangent, say so.
+${REVISE("1-2")}
+${PROSE("1-2")}
+- "extend": ${i.depth >= 3 ? "[] (already deep)" : "0-1 further step in the reasoning, only if it is genuinely missing"}. Each has a "title" (advice), a one-sentence "detail", a "statement", and "children": [].
+- "challenge": 1 if there is a real hole in the reasoning, otherwise [].`
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
@@ -108,7 +120,7 @@ ${PERSPECTIVE} If this point is a tangent or too deep, say so and suggest foldin
         { role: "system", content: SYSTEM },
         {
           role: "user",
-          content: `${context(i)}\n\n${task}\n\nReturn JSON: {"bigPicture":{"status","diagnosis","nextMove","nextLabel"},"extend":[{"title","detail","statement","children":[{"suggestion","statement"}]}],"challenge":[{"title","detail","statement"}]}`,
+          content: `${context(i)}\n\n${task}\n\nReturn JSON: {"bigPicture":{"status","diagnosis","nextMove","nextLabel"},"revise":[{"title","statement"}],"prose":[{"title","statement"}],"extend":[{"title","detail","statement","children":[{"suggestion","statement"}]}],"challenge":[{"title","detail","statement"}]}`,
         },
       ],
     }),
@@ -116,16 +128,16 @@ ${PERSPECTIVE} If this point is a tangent or too deep, say so and suggest foldin
   if (!res.ok) throw new Error(`OpenAI request failed (${res.status})`)
   const data = await res.json()
   const parsed = JSON.parse(data.choices[0].message.content)
-  const map = (arr: unknown, type: "extend" | "challenge") =>
+  const map = (arr: unknown, type: "extend" | "challenge" | "revise" | "prose") =>
     (Array.isArray(arr) ? arr : []).slice(0, 4).map((o: Record<string, unknown>) => {
       const kids = (Array.isArray(o.children) ? o.children : []).slice(0, 6) as Record<string, unknown>[]
       return {
         type,
         title: str(o.title, 300),
         detail: str(o.detail),
-        statement: str(o.statement || o.title, 400),
+        statement: unlabel(str(o.statement || o.title, type === "prose" ? 1500 : 400)),
         children: kids.map((c) => str(c?.suggestion ?? c, 300)),
-        childStatements: kids.map((c) => str(c?.statement ?? c?.suggestion ?? c, 400)),
+        childStatements: kids.map((c) => unlabel(str(c?.statement ?? c?.suggestion ?? c, 400))),
         sourced: false,
       }
     })
@@ -138,7 +150,12 @@ ${PERSPECTIVE} If this point is a tangent or too deep, say so and suggest foldin
           nextLabel: str(parsed.bigPicture.nextLabel, 20),
         }
       : null,
-    items: [...map(parsed.extend, "extend"), ...map(parsed.challenge, "challenge")],
+    items: [
+      ...map(parsed.revise, "revise"),
+      ...map(parsed.prose, "prose"),
+      ...map(parsed.extend, "extend"),
+      ...map(parsed.challenge, "challenge"),
+    ],
   }
 }
 
