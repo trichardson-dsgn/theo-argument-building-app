@@ -16,7 +16,7 @@ const SYSTEM = `You are a sharp thinking partner for someone developing a talk o
 Every suggestion has two voices:
 - "title" and "detail" speak TO the author as advice (e.g. "Define what you mean by...", "Show a case where...").
 - "statement" is the text as it would appear IN their outline, in the author's own voice: never an instruction or a question, and never prefixed with an outline label like "1.1:". Outline points are one sentence; only prose is longer.
-Voice for anything that goes into the outline: write like the author talks. Match their wording and register from what they have written. Plain words, short sentences, contractions, a bit of personality. No corporate or academic vocabulary (avoid words like leverage, foster, enhance, crucial, landscape, underscore, delve, navigate, robust, pivotal).
+Voice for anything that goes into the outline: sound like the author at their best. Take their register, vocabulary and sentence length from what they have written and stay close to it; do not make it more casual or more formal than theirs. Default to clear, natural, confident writing a thoughtful speaker would say on stage: precise words, varied sentences, no filler. Avoid both slang or chatty asides ("Ever noticed...?", "Here's the thing", "pretty much", rhetorical questions to the reader) and corporate or academic vocabulary (leverage, foster, enhance, crucial, landscape, underscore, delve, navigate, robust, pivotal).
 The author is building ONE argument toward ONE thesis, for a talk or post of limited length. The shape of a strong piece:
 - one clear thesis;
 - 3-5 key points (level 1) that each move the audience one step closer to believing it, in an order that builds;
@@ -24,7 +24,7 @@ The author is building ONE argument toward ONE thesis, for a talk or post of lim
 - sub-points (level 2) where the reasoning needs another step; they need less evidence and more plain explanation;
 - prose under a point is how the author works out and justifies what they mean;
 - be wary of going deeper than level 2 or 3: depth is time the audience spends away from the thesis.
-Help the argument converge. Improving what is already written (rewording, explaining, justifying) is often more useful than adding new points. Write for a general audience: vivid, concrete, conversational, never academic.`
+Help the argument converge. Improving what is already written (rewording, explaining, justifying) is often more useful than adding new points. Write for a general audience: concrete and clear, never academic.`
 
 const list = (v: unknown, n: number) =>
   Array.isArray(v) ? v.map((x) => String(x).slice(0, 500)).filter((x) => x.trim()).slice(-n) : []
@@ -85,7 +85,7 @@ const norm = (u: string) => {
 const PERSPECTIVE = `- "bigPicture": step back from the focused point and judge the WHOLE argument against the shape of a strong piece. {"status": one of "just starting" | "taking shape" | "too deep" | "drifting" | "gaps" | "strong", "diagnosis": one direct sentence on where the argument as a whole stands, "nextMove": the single most valuable next step for the whole piece (which may be somewhere other than the focused point, e.g. "Give key point 3 a story" or "Fold 2.1.1 into 2.1"), "nextLabel": the label of the point that next step is about (e.g. "3", "2.1", "THESIS")}. Do not praise; be an editor. If the focused point is deeper than level 2, or the outline goes deeper than level 2, name that in the diagnosis and use "too deep" unless key points are missing support.`
 
 const REVISE = (n: string) => `- "revise": ${n} rewrites of the focused text itself, each improving it in a different way (sharper, plainer, more specific, more surprising, closer to the thesis). "title" says in a few words what the rewrite changes (to the author), "statement" is the full replacement wording in the author's voice. Keep it about as short as theirs.`
-const PROSE = (n: string) => `- "prose": ${n} short drafts (50-110 words) of what the author would actually SAY to justify or explain this point, as spoken prose in their voice: conversational, concrete, one idea, the way you'd explain it to a friend. "title" names the approach (e.g. "Start from a familiar frustration"), "statement" is the prose. Not a summary, not a list; do not invent facts or statistics.`
+const PROSE = (n: string) => `- "prose": ${n} short drafts (50-110 words) of what the author would actually SAY to justify or explain this point, in their voice and register: clear, concrete, one idea, the way they would actually say it in the talk. "title" names the approach (e.g. "Start from a familiar situation"), "statement" is the prose. Not a summary, not a list; do not invent facts or statistics.`
 
 async function ideas(key: string, i: Input) {
   const task =
@@ -172,7 +172,7 @@ async function evidence(key: string, i: Input) {
 
 Search the web for ${i.level === "thesis" ? "2-3 real, specific opening hooks or" : i.depth === 1 ? "3 real, specific" : "1-2 real, quick"} things a speaker could use to make this ${i.level} land with a general audience: a story about a person or company, a well-known moment from history, sport, business or culture, a surprising fact, or a striking quote. Think of what makes a great talk or a widely shared article fun to consume, not a literature review. Avoid academic papers and jargon; if research matters, use one striking finding as reported by mainstream journalism. Pick things that fit this point's role and lead naturally into the next point.${i.depth >= 2 ? " This is a sub-point, so keep it light: one quick, clarifying example is enough." : ""} Only include items you actually found, each with its source URL. Never invent details or figures.
 
-Reply with only JSON: {"items":[{"title":"short label","detail":"1-2 sentences to the author on why it is compelling and how to use it here","statement":"the story or fact as one vivid, conversational sentence for the outline, e.g. 'When Dr. Seuss was bet he could not write a book with only 50 words, he wrote Green Eggs and Ham.'","type":"story"|"example"|"surprising fact"|"quote","url":"source url","source":"publication or site name"}]}`,
+Reply with only JSON: {"items":[{"title":"short label","detail":"1-2 sentences to the author on why it is compelling and how to use it here","statement":"the story or fact as one clear, specific sentence for the outline, e.g. 'When Dr. Seuss was bet he could not write a book with only 50 words, he wrote Green Eggs and Ham.'","type":"story"|"example"|"surprising fact"|"quote","url":"source url","source":"publication or site name"}]}`,
     }),
   })
   if (!res.ok) throw new Error(`Web search failed (${res.status})`)
