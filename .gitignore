@@ -1,15 +1,17 @@
 node_modules/
+.next/
+out/
 dist/
 build/
 .cache/
 .env*
-.vite/
-vite.config.*.timestamp-*
+next-env.d.ts
 *.tsbuildinfo
 *-debug.log*
 logs/
 *.log
 .claude-replay.*
+.figma/runtime/
 .tmp-*
 /.figma/design-context/
 
