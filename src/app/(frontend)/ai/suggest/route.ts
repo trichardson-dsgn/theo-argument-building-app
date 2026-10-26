@@ -6,6 +6,9 @@ type Input = {
   text: string
   outline: string
   depth: number
+  feedback: string[] // author's notes for this point
+  guidance: string[] // author's notes for every suggestion
+  previous: string[] // last round's suggestions, to avoid repeats
 }
 
 const SYSTEM = `You are a sharp thinking partner for someone developing a talk or essay. The human writes; you suggest. Be specific, concrete and brief. Never write the talk for them.
@@ -13,6 +16,9 @@ Every suggestion has two voices:
 - "title" and "detail" speak TO the author as advice (e.g. "Define what you mean by...", "Show a case where...").
 - "statement" is the text as it would appear IN their outline: a declarative claim written in the author's voice, never an instruction or a question.
 Keep the big picture. A talk lives or dies on a clear thesis, a few strong key points, and memorable support. Favour sharpening, connecting and cutting over adding more depth. Write for a general audience: vivid, concrete, conversational, never academic.`
+
+const list = (v: unknown, n: number) =>
+  Array.isArray(v) ? v.map((x) => String(x).slice(0, 500)).filter((x) => x.trim()).slice(-n) : []
 
 function parseInput(body: unknown): Input | null {
   if (!body || typeof body !== "object") return null
@@ -25,6 +31,9 @@ function parseInput(body: unknown): Input | null {
     text: b.text.slice(0, 1500),
     outline: typeof b.outline === "string" ? b.outline.slice(0, 10000) : "",
     depth: Math.max(0, Math.min(6, Number(b.depth) || 0)),
+    feedback: list(b.feedback, 12),
+    guidance: list(b.guidance, 12),
+    previous: list(b.previous, 15),
   }
 }
 
@@ -34,7 +43,14 @@ ${i.outline}
 
 ${i.level === "thesis" ? "Thesis" : "Focused point"}: ${i.text}
 
-Use the whole outline: fit the focused point's role in the argument, build toward the thesis, connect with neighbouring points, and do not repeat what other points already cover.`
+Use the whole outline: fit the focused point's role in the argument, build toward the thesis, connect with neighbouring points, and do not repeat what other points already cover.${
+    i.guidance.length || i.feedback.length
+      ? `
+
+The author has given this feedback on earlier suggestions. Follow it closely; the most recent note matters most:
+${[...i.guidance.map((g) => `- (for all points) ${g}`), ...i.feedback.map((f) => `- (for this point) ${f}`)].join("\n")}`
+      : ""
+  }${i.previous.length ? `\n\nAlready suggested last round (offer fresh options, do not repeat):\n${i.previous.map((p) => `- ${p}`).join("\n")}` : ""}`
 
 function extractJson(text: string) {
   const start = text.indexOf("{")

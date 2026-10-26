@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useLayoutEffect, useRef, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 
 type Kind = "thesis" | "point" | "evidence"
 type Node = {
@@ -28,9 +28,10 @@ type Suggestion = {
   status: "new" | "added" | "dismissed"
   addedChildren?: number[]
 }
-type Batch = { id: string; nodeId: string; text: string; at: number; items: Suggestion[]; perspective?: string; errors: Partial<Record<"ideas" | "evidence", string>> }
+type Batch = { id: string; nodeId: string; text: string; at: number; items: Suggestion[]; perspective?: string; steer?: string; errors: Partial<Record<"ideas" | "evidence", string>> }
 type Version = { id: string; label: string; at: number; outline: Node }
-type State = { outline: Node; batches: Batch[]; versions: Version[] }
+// feedback: remembered steering notes per point; guidance: notes that apply to every suggestion.
+type State = { outline: Node; batches: Batch[]; versions: Version[]; feedback: Record<string, string[]>; guidance: string[] }
 type DropPos = "before" | "after" | "inside"
 
 const uid = () => Math.random().toString(36).slice(2, 10)
@@ -101,23 +102,21 @@ export default function Workspace() {
   const [showVersions, setShowVersions] = useState(false)
   const [drag, setDrag] = useState<string | null>(null)
   const [drop, setDrop] = useState<{ id: string; pos: DropPos } | null>(null)
-  const [railTop, setRailTop] = useState(0)
   const focusNext = useRef<string | null>(null)
   const pendingRef = useRef(pending)
   pendingRef.current = pending
   const levelRef = useRef(level)
   levelRef.current = level
-  const canvasRef = useRef<HTMLDivElement>(null)
   const rowRefs = useRef<Record<string, HTMLDivElement | null>>({})
 
   useEffect(() => {
     try {
       const saved = localStorage.getItem(STORAGE)
-      const s: State = saved ? JSON.parse(saved) : { outline: mk("", "thesis"), batches: [], versions: [] }
+      const s: State = { feedback: {}, guidance: [], ...(saved ? JSON.parse(saved) : { outline: mk("", "thesis"), batches: [], versions: [] }) }
       setState(s)
       if (!s.outline.text) focusNext.current = s.outline.id
     } catch {
-      setState({ outline: mk("", "thesis"), batches: [], versions: [] })
+      setState({ outline: mk("", "thesis"), batches: [], versions: [], feedback: {}, guidance: [] })
     }
   }, [])
   useEffect(() => {
@@ -195,14 +194,6 @@ export default function Workspace() {
   const sel = state && selected ? find(state.outline, selected) : null
   const selText = sel?.node.text ?? ""
 
-  // Keep the suggestions beside the point being worked on.
-  useLayoutEffect(() => {
-    const row = selected ? rowRefs.current[selected] : null
-    const canvas = canvasRef.current
-    if (!row || !canvas) return
-    setRailTop(Math.max(0, row.getBoundingClientRect().top - canvas.getBoundingClientRect().top))
-  }, [selected, state?.outline, level])
-
   // Suggest automatically once the writer pauses on a point they have changed.
   useEffect(() => {
     if (!state || !sel || viewing) return
@@ -257,7 +248,7 @@ export default function Workspace() {
     setOutline((o) => update(o, parentId, (n) => ({ ...n, children: [...n.children, ...nodes] })))
 
   // The thesis gets structure and challenges; points below it also get web evidence.
-  async function suggest(nodeId: string, only?: ("ideas" | "evidence")[]) {
+  async function suggest(nodeId: string, only?: ("ideas" | "evidence")[], steer?: { note: string; feedback: string[]; guidance: string[] }) {
     const target = find(state!.outline, nodeId)
     if (!target || pendingRef.current[nodeId]) return
     const depth = target.path.length - 1
@@ -266,11 +257,19 @@ export default function Workspace() {
     // A targeted request (e.g. evidence for the thesis) joins the current round instead of starting a new one.
     const current = state!.batches.find((b) => b.nodeId === nodeId)
     const reuse = only && current && current.text === text
-    const batch: Batch = reuse ? current : { id: uid(), nodeId, text, at: Date.now(), items: [], errors: {} }
+    const batch: Batch = reuse ? current : { id: uid(), nodeId, text, at: Date.now(), items: [], errors: {}, steer: steer?.note }
     if (!reuse) setState((s) => (s ? { ...s, batches: [batch, ...s.batches] } : s))
     setPending((p) => ({ ...p, [nodeId]: Object.fromEntries(kinds.map((k) => [k, true])) }))
     setShowEarlier(false)
-    const payload = { level: depth === 0 ? "thesis" : "point", text, outline: serialize(state!.outline, nodeId), depth }
+    const payload = {
+      level: depth === 0 ? "thesis" : "point",
+      text,
+      outline: serialize(state!.outline, nodeId),
+      depth,
+      feedback: steer?.feedback ?? state!.feedback[nodeId] ?? [],
+      guidance: steer?.guidance ?? state!.guidance,
+      previous: current && !reuse ? current.items.map((i) => i.title) : [],
+    }
     await Promise.all(
       kinds.map(async (kind) => {
         let items: Suggestion[] = []
@@ -319,6 +318,18 @@ export default function Workspace() {
     }
   }
 
+  function steer(nodeId: string, note: string, everywhere: boolean) {
+    const feedback = everywhere ? state!.feedback[nodeId] ?? [] : [...(state!.feedback[nodeId] ?? []), note]
+    const guidance = everywhere ? [...state!.guidance, note] : state!.guidance
+    setState((s) => (s ? { ...s, guidance, feedback: { ...s.feedback, [nodeId]: feedback } } : s))
+    suggest(nodeId, undefined, { note, feedback, guidance })
+  }
+  function forget(nodeId: string, note: string, everywhere: boolean) {
+    setState((s) =>
+      s ? everywhere ? { ...s, guidance: s.guidance.filter((g) => g !== note) } : { ...s, feedback: { ...s.feedback, [nodeId]: (s.feedback[nodeId] ?? []).filter((f) => f !== note) } } : s,
+    )
+  }
+
   function saveVersion() {
     const label = prompt("Name this version", `Version ${state!.versions.length + 1}`)
     if (!label) return
@@ -356,7 +367,7 @@ export default function Workspace() {
             if (drag && drop) setOutline((o) => moveNode(o, drag, drop.id, drop.pos))
             endDrag()
           }}
-          className={`group relative flex items-start gap-1 rounded-md py-0.5 pr-2 transition-colors ${dropHere === "inside" ? "bg-sky-50 ring-1 ring-sky-300" : ""}`}
+          className={`group relative -mx-2 flex items-start gap-1 rounded-lg py-0.5 pl-2 pr-2 transition-colors ${dropHere === "inside" ? "bg-sky-50 ring-1 ring-sky-300" : isSel && !viewing ? "bg-white/80 shadow-[0_0_0_1px_rgb(231,229,228)]" : ""}`}
         >
           {dropHere === "before" && <span className="absolute -top-px left-6 right-0 h-0.5 rounded bg-sky-500" />}
           {dropHere === "after" && <span className="absolute -bottom-px left-6 right-0 h-0.5 rounded bg-sky-500" />}
@@ -479,12 +490,12 @@ export default function Workspace() {
         </div>
       )}
 
-      <div ref={canvasRef} className="relative mx-auto flex max-w-[1180px] gap-12 px-10 pb-[50vh] pt-24">
+      <div className="relative mx-auto flex max-w-[1180px] gap-12 px-10 pb-[50vh] pt-24">
         <ul className="min-w-0 max-w-[660px] flex-1">{renderNode(outline, 0, !!viewing)}</ul>
 
-        <div className="relative w-[360px] shrink-0">
+        <div className="w-[360px] shrink-0">
           {sel && !viewing && (
-            <div style={{ marginTop: railTop }} className="transition-[margin] duration-300 ease-out">
+            <div className="sticky top-16 max-h-[calc(100vh-6rem)] overflow-y-auto pb-6 pr-1">
               {canSuggest ? (
                 <div className="space-y-5">
                   <div className="flex gap-3 text-[11px] text-stone-400">
@@ -492,8 +503,16 @@ export default function Workspace() {
                     {isThesis && <button disabled={!!pending[sel.node.id]} onClick={() => suggest(sel.node.id, ["evidence"])} className="hover:text-stone-800 disabled:opacity-40">Find evidence</button>}
                   </div>
                   {latest && (
-                    <BatchView batch={latest} pending={pending[sel.node.id]} isThesis={!!isThesis} stale={latest.text !== sel.node.text.trim()} onAccept={accept} onDismiss={(b, i) => markItem(b.id, i.id, { status: "dismissed" })} />
+                    <BatchView key={latest.id} batch={latest} pending={pending[sel.node.id]} isThesis={!!isThesis} stale={latest.text !== sel.node.text.trim()} onAccept={accept} onDismiss={(b, i) => markItem(b.id, i.id, { status: "dismissed" })} />
                   )}
+                  <Steer
+                    key={sel.node.id}
+                    notes={state.feedback[sel.node.id] ?? []}
+                    guidance={state.guidance}
+                    busy={!!pending[sel.node.id]}
+                    onSubmit={(note, everywhere) => steer(sel.node.id, note, everywhere)}
+                    onForget={(note, everywhere) => forget(sel.node.id, note, everywhere)}
+                  />
                   {earlier.length > 0 && (
                     <div>
                       <button onClick={() => setShowEarlier(!showEarlier)} className="text-[11px] text-stone-400 hover:text-stone-800">
@@ -554,6 +573,7 @@ function BatchView({
   if (!isThesis) groups.unshift(groups.splice(1, 1)[0])
   return (
     <div className="space-y-5">
+      {batch.steer && <p className="text-[11px] text-stone-400">Steered by “{batch.steer}”</p>}
       {stale && <p className="text-[11px] text-stone-400">Written for an earlier wording.</p>}
       {batch.perspective ? (
         <p className="text-[13px] italic leading-snug text-stone-500">{batch.perspective}</p>
@@ -577,6 +597,67 @@ function BatchView({
         )
       })}
     </div>
+  )
+}
+
+function Steer({
+  notes, guidance, busy, onSubmit, onForget,
+}: {
+  notes: string[]
+  guidance: string[]
+  busy: boolean
+  onSubmit: (note: string, everywhere: boolean) => void
+  onForget: (note: string, everywhere: boolean) => void
+}) {
+  const [text, setText] = useState("")
+  const [everywhere, setEverywhere] = useState(false)
+  const submit = () => {
+    if (!text.trim() || busy) return
+    onSubmit(text.trim(), everywhere)
+    setText("")
+  }
+  return (
+    <div className="border-t border-stone-200 pt-4">
+      <div className="rounded-xl border border-stone-200 bg-white focus-within:border-stone-400">
+        <textarea
+          value={text}
+          rows={2}
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault()
+              submit()
+            }
+          }}
+          placeholder="Steer the next round, e.g. “more personal stories”, “less about startups”"
+          className="field-sizing-content block max-h-40 min-h-[52px] w-full resize-none bg-transparent px-3 pt-2.5 text-[13px] leading-snug outline-none placeholder:text-stone-400"
+        />
+        <div className="flex items-center justify-between px-3 pb-2 pt-1">
+          <label className="flex cursor-pointer items-center gap-1.5 text-[11px] text-stone-500">
+            <input type="checkbox" checked={everywhere} onChange={(e) => setEverywhere(e.target.checked)} className="h-3 w-3 accent-stone-900" />
+            Remember for all points
+          </label>
+          <button disabled={!text.trim() || busy} onClick={submit} className="rounded-md bg-stone-900 px-2.5 py-1 text-[11px] text-white disabled:opacity-30">
+            Try again
+          </button>
+        </div>
+      </div>
+      {(notes.length > 0 || guidance.length > 0) && (
+        <div className="mt-2.5 flex flex-wrap gap-1.5">
+          {guidance.map((g) => <Note key={`g${g}`} text={g} everywhere onRemove={() => onForget(g, true)} />)}
+          {notes.map((n) => <Note key={`n${n}`} text={n} onRemove={() => onForget(n, false)} />)}
+        </div>
+      )}
+    </div>
+  )
+}
+function Note({ text, everywhere, onRemove }: { text: string; everywhere?: boolean; onRemove: () => void }) {
+  return (
+    <span className="group/n inline-flex max-w-full items-center gap-1 rounded-full bg-stone-200/70 py-0.5 pl-2.5 pr-1 text-[11px] text-stone-600" title={everywhere ? "Remembered for all points" : "Remembered for this point"}>
+      {everywhere && <span className="text-stone-400">All ·</span>}
+      <span className="truncate">{text}</span>
+      <button onClick={onRemove} aria-label="Forget this note" className="flex h-4 w-4 items-center justify-center rounded-full text-stone-400 hover:bg-stone-300 hover:text-stone-800">×</button>
+    </span>
   )
 }
 
