@@ -28,7 +28,8 @@ type Suggestion = {
   status: "new" | "added" | "dismissed"
   addedChildren?: number[]
 }
-type Batch = { id: string; nodeId: string; text: string; at: number; items: Suggestion[]; perspective?: string; steer?: string; errors: Partial<Record<"ideas" | "evidence", string>> }
+type Batch = { id: string; nodeId: string; text: string; at: number; items: Suggestion[]; perspective?: string; bigPicture?: BigPicture | null; steer?: string; errors: Partial<Record<"ideas" | "evidence", string>> }
+type BigPicture = { status: string; diagnosis: string; nextMove: string; nextLabel: string }
 type Version = { id: string; label: string; at: number; outline: Node }
 // feedback: remembered steering notes per point; guidance: notes that apply to every suggestion.
 type State = { outline: Node; batches: Batch[]; versions: Version[]; feedback: Record<string, string[]>; guidance: string[] }
@@ -69,12 +70,32 @@ function parentOf(n: Node, id: string): Node | null {
   return null
 }
 const count = (n: Node): number => 1 + n.children.reduce((s, c) => s + count(c), 0)
-// Whole outline as indented text, with the focused point marked, so suggestions fit the full argument.
-const serialize = (n: Node, focusId: string, depth = 0): string =>
+// Whole outline as labelled, indented text (THESIS, 1, 1.1...), with the focused point marked.
+const childLabel = (parent: string, depth: number, i: number) => (depth === 0 ? `${i + 1}` : `${parent}.${i + 1}`)
+const written = (n: Node) => n.children.filter((c) => c.text.trim())
+const serialize = (n: Node, focusId: string, depth = 0, label = "THESIS"): string =>
   [
-    `${"  ".repeat(depth)}${n.id === focusId ? ">>> " : "- "}${depth === 0 ? "THESIS: " : n.kind === "evidence" ? "[evidence] " : ""}${n.text.trim() || "(empty)"}`,
-    ...n.children.filter((c) => c.text.trim()).map((c) => serialize(c, focusId, depth + 1)),
+    `${"  ".repeat(depth)}${n.id === focusId ? ">>> " : ""}${label}${n.kind === "evidence" ? " [evidence]" : ""}: ${n.text.trim() || "(empty)"}`,
+    ...written(n).map((c, i) => serialize(c, focusId, depth + 1, childLabel(label, depth, i))),
   ].join("\n")
+const labelIds = (n: Node, label = "THESIS", depth = 0, map = new Map<string, string>()) => {
+  map.set(label, n.id)
+  written(n).forEach((c, i) => labelIds(c, childLabel(label, depth, i), depth + 1, map))
+  return map
+}
+const supportCount = (n: Node): number => (n.kind === "evidence" || n.source ? 1 : 0) + n.children.reduce((s, c) => s + supportCount(c), 0)
+const maxDepth = (n: Node, d = 0): number => Math.max(d, ...n.children.filter((c) => c.text.trim()).map((c) => maxDepth(c, d + 1)))
+// A plain summary of the argument's shape so the AI can judge it against a strong talk.
+function shapeOf(o: Node) {
+  const kps = written(o)
+  const bare = kps.map((k, i) => (supportCount(k) ? 0 : i + 1)).filter(Boolean)
+  return [
+    `${kps.length} key points (aim 3-5).`,
+    kps.length ? `Support per key point: ${kps.map((k, i) => `${i + 1}: ${supportCount(k)}`).join(", ")} (aim 1-2 each).` : "",
+    bare.length ? `Key points with no support yet: ${bare.join(", ")}.` : "",
+    `Deepest level: ${maxDepth(o)} (aim 2 or less).`,
+  ].filter(Boolean).join(" ")
+}
 const flatten = (n: Node): Node[] => [n, ...n.children.flatMap(flatten)]
 // Drop into the gap after row `afterId`, at outline depth `depth`: one deeper makes it the first
 // child of that row; equal or shallower places it after that row's ancestor at that depth.
@@ -274,7 +295,8 @@ export default function Workspace() {
     const target = find(state!.outline, nodeId)
     if (!target || pendingRef.current[nodeId]) return
     const depth = target.path.length - 1
-    const kinds = only ?? (depth === 0 || depth >= 3 ? (["ideas"] as const) : (["ideas", "evidence"] as const))
+    // Evidence is mainly a key-point job: auto-search only for key points that are still light on support.
+    const kinds = only ?? (depth === 1 && supportCount(target.node) < 2 ? (["ideas", "evidence"] as const) : (["ideas"] as const))
     const text = target.node.text.trim()
     // A targeted request (e.g. evidence for the thesis) joins the current round instead of starting a new one.
     const current = state!.batches.find((b) => b.nodeId === nodeId)
@@ -287,6 +309,7 @@ export default function Workspace() {
       level: depth === 0 ? "thesis" : "point",
       text,
       outline: serialize(state!.outline, nodeId),
+      shape: shapeOf(state!.outline),
       depth,
       feedback: steer?.feedback ?? state!.feedback[nodeId] ?? [],
       guidance: steer?.guidance ?? state!.guidance,
@@ -295,19 +318,19 @@ export default function Workspace() {
     await Promise.all(
       kinds.map(async (kind) => {
         let items: Suggestion[] = []
-        let perspective = ""
+        let bigPicture: BigPicture | null = null
         let error = ""
         try {
           const res = await fetch("/ai/suggest", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kind, ...payload }) })
           const data = await res.json()
           if (!res.ok) throw new Error(data.error || "Request failed")
-          perspective = data.perspective || ""
+          bigPicture = data.bigPicture || null
           items = data.items.map((i: Suggestion) => ({ ...i, id: uid(), status: "new" }))
         } catch (e) {
           error = e instanceof Error ? e.message : "Request failed"
         }
         setState((s) =>
-          s ? { ...s, batches: s.batches.map((b) => (b.id === batch.id ? { ...b, items: [...b.items, ...items], ...(perspective ? { perspective } : {}), errors: { ...b.errors, ...(error ? { [kind]: error } : {}) } } : b)) } : s,
+          s ? { ...s, batches: s.batches.map((b) => (b.id === batch.id ? { ...b, items: [...b.items, ...items], ...(bigPicture ? { bigPicture } : {}), errors: { ...b.errors, ...(error ? { [kind]: error } : {}) } } : b)) } : s,
         )
         setPending((p) => ({ ...p, [nodeId]: { ...p[nodeId], [kind]: false } }))
       }),
@@ -499,6 +522,12 @@ export default function Workspace() {
   const nodeBatches = sel ? state.batches.filter((b) => b.nodeId === sel.node.id) : []
   const [latest, ...earlier] = nodeBatches
   const isThesis = sel?.path.length === 1
+  const selDepth = sel ? sel.path.length - 1 : 0
+  const labels = labelIds(state.outline)
+  const goTo = (label: string) => {
+    const id = labels.get(label.replace(/^point\s*/i, "").trim().toUpperCase() === "THESIS" ? "THESIS" : label.replace(/^point\s*/i, "").trim())
+    return id && id !== selected ? () => focus(id) : null
+  }
   const canSuggest = !!sel && !viewing && sel.node.text.trim().length >= MIN_CHARS
 
   return (
@@ -561,10 +590,14 @@ export default function Workspace() {
                 <div className="space-y-5">
                   <div className="flex gap-3 text-[11px] text-stone-400">
                     <button disabled={!!pending[sel.node.id]} onClick={() => suggest(sel.node.id)} className="hover:text-stone-800 disabled:opacity-40">More ideas</button>
-                    {isThesis && <button disabled={!!pending[sel.node.id]} onClick={() => suggest(sel.node.id, ["evidence"])} className="hover:text-stone-800 disabled:opacity-40">Find evidence</button>}
+                    {(selDepth !== 1 || (latest && !latest.items.some((i) => i.type === "evidence"))) && (
+                      <button disabled={!!pending[sel.node.id]} onClick={() => suggest(sel.node.id, ["evidence"])} className="hover:text-stone-800 disabled:opacity-40">
+                        {selDepth === 0 ? "Find an opening hook" : selDepth === 1 ? "Find evidence" : "Find a quick example"}
+                      </button>
+                    )}
                   </div>
                   {latest && (
-                    <BatchView key={latest.id} batch={latest} pending={pending[sel.node.id]} isThesis={!!isThesis} stale={latest.text !== sel.node.text.trim()} onAccept={accept} onDismiss={(b, i) => markItem(b.id, i.id, { status: "dismissed" })} />
+                    <BatchView key={latest.id} goTo={goTo} batch={latest} pending={pending[sel.node.id]} isThesis={!!isThesis} stale={latest.text !== sel.node.text.trim()} onAccept={accept} onDismiss={(b, i) => markItem(b.id, i.id, { status: "dismissed" })} />
                   )}
                   <Steer
                     key={sel.node.id}
@@ -616,9 +649,10 @@ export default function Workspace() {
 }
 
 function BatchView({
-  batch, pending, isThesis, stale, onAccept, onDismiss,
+  batch, pending, isThesis, stale, onAccept, onDismiss, goTo,
 }: {
   batch: Batch
+  goTo?: (label: string) => (() => void) | null
   pending?: { ideas?: boolean; evidence?: boolean }
   isThesis: boolean
   stale?: boolean
@@ -636,7 +670,9 @@ function BatchView({
     <div className="space-y-5">
       {batch.steer && <p className="text-[11px] text-stone-400">Steered by “{batch.steer}”</p>}
       {stale && <p className="text-[11px] text-stone-400">Written for an earlier wording.</p>}
-      {batch.perspective ? (
+      {batch.bigPicture ? (
+        <BigPictureCard bp={batch.bigPicture} go={goTo?.(batch.bigPicture.nextLabel) ?? null} />
+      ) : batch.perspective ? (
         <p className="text-[13px] italic leading-snug text-stone-500">{batch.perspective}</p>
       ) : pending?.ideas ? (
         <Shimmer />
@@ -657,6 +693,31 @@ function BatchView({
           </section>
         )
       })}
+    </div>
+  )
+}
+
+function BigPictureCard({ bp, go }: { bp: BigPicture; go: (() => void) | null }) {
+  const tone =
+    bp.status === "strong" ? "bg-emerald-100 text-emerald-800" : ["too deep", "drifting", "gaps"].includes(bp.status) ? "bg-amber-100 text-amber-800" : "bg-stone-200 text-stone-700"
+  return (
+    <div className="rounded-xl border border-stone-200 bg-white p-3.5">
+      <div className="mb-1.5 flex items-center gap-2">
+        <span className="text-[11px] font-medium uppercase tracking-wider text-stone-400">The argument</span>
+        <span className={`rounded-full px-2 py-px text-[11px] font-medium ${tone}`}>{bp.status}</span>
+      </div>
+      <p className="text-[14px] leading-snug text-stone-800">{bp.diagnosis}</p>
+      {bp.nextMove && (
+        <div className="mt-2.5 flex items-start gap-2 border-t border-stone-100 pt-2.5">
+          <span className="mt-px text-[11px] font-medium uppercase tracking-wider text-stone-400">Next</span>
+          <p className="flex-1 text-[13px] leading-snug text-stone-700">{bp.nextMove}</p>
+          {go && (
+            <button onClick={go} className="shrink-0 rounded-md bg-stone-900 px-2 py-0.5 text-[11px] text-white hover:bg-stone-700">
+              Go to {bp.nextLabel === "THESIS" ? "thesis" : bp.nextLabel}
+            </button>
+          )}
+        </div>
+      )}
     </div>
   )
 }
