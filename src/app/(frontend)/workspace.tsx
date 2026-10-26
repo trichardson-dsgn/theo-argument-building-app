@@ -34,7 +34,11 @@ type Batch = { id: string; nodeId: string; text: string; at: number; items: Sugg
 type BigPicture = { status: string; diagnosis: string; nextMove: string; nextLabel: string }
 type Version = { id: string; label: string; at: number; outline: Node }
 // feedback: remembered steering notes per point; guidance: notes that apply to every suggestion.
-type State = { outline: Node; batches: Batch[]; versions: Version[]; feedback: Record<string, string[]>; guidance: string[] }
+// want: the kinds of suggestion the author has switched on.
+type State = { outline: Node; batches: Batch[]; versions: Version[]; feedback: Record<string, string[]>; guidance: string[]; want: SuggestionType[] }
+type Pending = Record<string, Partial<Record<SuggestionType, boolean>>>
+const ALL_TYPES: SuggestionType[] = ["revise", "prose", "evidence", "extend", "challenge"]
+const TYPE_LABEL: Record<SuggestionType, string> = { revise: "Reword", prose: "Prose", evidence: "Research", extend: "Build out", challenge: "Push back" }
 type DropPos = "before" | "after" | "inside" // used by keyboard indent/outdent
 
 const uid = () => Math.random().toString(36).slice(2, 10)
@@ -141,7 +145,7 @@ export default function Workspace() {
   const [toast, setToast] = useState<{ level: number; from: number; key: number } | null>(null)
   const [selected, setSelected] = useState<string | null>(null)
   const [viewing, setViewing] = useState<Version | null>(null)
-  const [pending, setPending] = useState<Record<string, { ideas?: boolean; evidence?: boolean }>>({})
+  const [pending, setPending] = useState<Pending>({})
   const [showEarlier, setShowEarlier] = useState(false)
   const [showVersions, setShowVersions] = useState(false)
   const [drag, setDrag] = useState<string | null>(null)
@@ -157,11 +161,11 @@ export default function Workspace() {
   useEffect(() => {
     try {
       const saved = localStorage.getItem(STORAGE)
-      const s: State = { feedback: {}, guidance: [], ...(saved ? JSON.parse(saved) : { outline: mk("", "thesis"), batches: [], versions: [] }) }
+      const s: State = { feedback: {}, guidance: [], want: ALL_TYPES, ...(saved ? JSON.parse(saved) : { outline: mk("", "thesis"), batches: [], versions: [] }) }
       setState(s)
       if (!s.outline.text) focusNext.current = s.outline.id
     } catch {
-      setState({ outline: mk("", "thesis"), batches: [], versions: [], feedback: {}, guidance: [] })
+      setState({ outline: mk("", "thesis"), batches: [], versions: [], feedback: {}, guidance: [], want: ALL_TYPES })
     }
   }, [])
   useEffect(() => {
@@ -292,21 +296,24 @@ export default function Workspace() {
   const addChildren = (parentId: string, nodes: Node[]) =>
     setOutline((o) => update(o, parentId, (n) => ({ ...n, children: [...n.children, ...nodes] })))
 
-  // The thesis gets structure and challenges; points below it also get web evidence.
-  async function suggest(nodeId: string, only?: ("ideas" | "evidence")[], steer?: { note: string; feedback: string[]; guidance: string[] }) {
+  // Fetch the requested kinds (default: whatever the author has switched on). An explicit request
+  // for specific kinds joins the current round instead of starting a new one.
+  async function suggest(nodeId: string, types?: SuggestionType[], steer?: { note: string; feedback: string[]; guidance: string[] }) {
     const target = find(state!.outline, nodeId)
-    if (!target || pendingRef.current[nodeId]) return
+    if (!target) return
+    const busy = pendingRef.current[nodeId] ?? {}
+    const wanted = (types ?? state!.want).filter((t) => !busy[t])
+    if (!wanted.length) return
     const depth = target.path.length - 1
-    // Evidence is mainly a key-point job: auto-search only for key points that are still light on support.
-    const kinds = only ?? (depth === 1 && supportCount(target.node) < 2 ? (["ideas", "evidence"] as const) : (["ideas"] as const))
     const text = target.node.text.trim()
-    // A targeted request (e.g. evidence for the thesis) joins the current round instead of starting a new one.
     const current = state!.batches.find((b) => b.nodeId === nodeId)
-    const reuse = only && current && current.text === text
-    const batch: Batch = reuse ? current : { id: uid(), nodeId, text, at: Date.now(), items: [], errors: {}, steer: steer?.note }
-    if (!reuse) setState((s) => (s ? { ...s, batches: [batch, ...s.batches] } : s))
-    setPending((p) => ({ ...p, [nodeId]: Object.fromEntries(kinds.map((k) => [k, true])) }))
-    setShowEarlier(false)
+    const reuse = !!types && !steer && !!current && current.text === text
+    const batch: Batch = reuse ? current! : { id: uid(), nodeId, text, at: Date.now(), items: [], errors: {}, steer: steer?.note }
+    if (!reuse) {
+      setState((s) => (s ? { ...s, batches: [batch, ...s.batches] } : s))
+      setShowEarlier(false)
+    }
+    setPending((p) => ({ ...p, [nodeId]: { ...p[nodeId], ...Object.fromEntries(wanted.map((t) => [t, true])) } }))
     const payload = {
       level: depth === 0 ? "thesis" : "point",
       text,
@@ -315,15 +322,19 @@ export default function Workspace() {
       depth,
       feedback: steer?.feedback ?? state!.feedback[nodeId] ?? [],
       guidance: steer?.guidance ?? state!.guidance,
-      previous: current && !reuse ? current.items.map((i) => i.title) : [],
+      previous: current ? current.items.map((i) => i.title) : [],
     }
+    const ideaTypes = wanted.filter((t) => t !== "evidence")
+    const calls: { kind: "ideas" | "evidence"; types: SuggestionType[] }[] = []
+    if (ideaTypes.length) calls.push({ kind: "ideas", types: ideaTypes })
+    if (wanted.includes("evidence")) calls.push({ kind: "evidence", types: ["evidence"] })
     await Promise.all(
-      kinds.map(async (kind) => {
+      calls.map(async ({ kind, types: ts }) => {
         let items: Suggestion[] = []
         let bigPicture: BigPicture | null = null
         let error = ""
         try {
-          const res = await fetch("/ai/suggest", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kind, ...payload }) })
+          const res = await fetch("/ai/suggest", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kind, want: ts, ...payload }) })
           const data = await res.json()
           if (!res.ok) throw new Error(data.error || "Request failed")
           bigPicture = data.bigPicture || null
@@ -332,16 +343,28 @@ export default function Workspace() {
           error = e instanceof Error ? e.message : "Request failed"
         }
         setState((s) =>
-          s ? { ...s, batches: s.batches.map((b) => (b.id === batch.id ? { ...b, items: [...b.items, ...items], ...(bigPicture ? { bigPicture } : {}), errors: { ...b.errors, ...(error ? { [kind]: error } : {}) } } : b)) } : s,
+          s ? { ...s, batches: s.batches.map((b) => (b.id === batch.id ? { ...b, items: [...b.items, ...items], ...(bigPicture ? { bigPicture } : {}), errors: { ...b.errors, [kind]: error || undefined } } : b)) } : s,
         )
-        setPending((p) => ({ ...p, [nodeId]: { ...p[nodeId], [kind]: false } }))
+        setPending((p) => {
+          const cur = { ...p[nodeId] }
+          ts.forEach((t) => delete cur[t])
+          const n = { ...p }
+          if (Object.keys(cur).length) n[nodeId] = cur
+          else delete n[nodeId]
+          return n
+        })
       }),
     )
-    setPending((p) => {
-      const n = { ...p }
-      delete n[nodeId]
-      return n
-    })
+  }
+
+  function toggleWant(t: SuggestionType) {
+    const on = state!.want.includes(t)
+    setState((s) => (s ? { ...s, want: on ? s.want.filter((x) => x !== t) : [...s.want, t] } : s))
+    // Switching a kind on fetches it for the current point right away.
+    if (!on && sel && !viewing && sel.node.text.trim().length >= MIN_CHARS) {
+      const l = state!.batches.find((b) => b.nodeId === sel.node.id)
+      if (!(l && l.text === sel.node.text.trim() && l.items.some((i) => i.type === t))) suggest(sel.node.id, [t])
+    }
   }
 
   const markItem = (batchId: string, itemId: string, patch: Partial<Suggestion>) =>
@@ -552,7 +575,6 @@ export default function Workspace() {
   const nodeBatches = sel ? state.batches.filter((b) => b.nodeId === sel.node.id) : []
   const [latest, ...earlier] = nodeBatches
   const isThesis = sel?.path.length === 1
-  const selDepth = sel ? sel.path.length - 1 : 0
   const labels = labelIds(state.outline)
   const goTo = (label: string) => {
     const id = labels.get(label.replace(/^point\s*/i, "").trim().toUpperCase() === "THESIS" ? "THESIS" : label.replace(/^point\s*/i, "").trim())
@@ -618,16 +640,25 @@ export default function Workspace() {
             <div className="sticky top-16 max-h-[calc(100vh-6rem)] overflow-y-auto pb-6 pr-1">
               {canSuggest ? (
                 <div className="space-y-5">
-                  <div className="flex gap-3 text-[11px] text-stone-400">
-                    <button disabled={!!pending[sel.node.id]} onClick={() => suggest(sel.node.id)} className="hover:text-stone-800 disabled:opacity-40">More ideas</button>
-                    {(selDepth !== 1 || (latest && !latest.items.some((i) => i.type === "evidence"))) && (
-                      <button disabled={!!pending[sel.node.id]} onClick={() => suggest(sel.node.id, ["evidence"])} className="hover:text-stone-800 disabled:opacity-40">
-                        {selDepth === 0 ? "Find an opening hook" : selDepth === 1 ? "Find evidence" : "Find a quick example"}
-                      </button>
-                    )}
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {ALL_TYPES.map((t) => {
+                      const on = state.want.includes(t)
+                      return (
+                        <button
+                          key={t}
+                          onClick={() => toggleWant(t)}
+                          aria-pressed={on}
+                          className={`flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-[12px] transition-colors ${on ? "bg-stone-900 text-white" : "border border-stone-300 text-stone-500 hover:border-stone-500 hover:text-stone-800"}`}
+                        >
+                          {t === "extend" && isThesis ? "Structure" : TYPE_LABEL[t]}
+                          {pending[sel.node.id]?.[t] && <span className="h-1 w-1 animate-pulse rounded-full bg-current" />}
+                        </button>
+                      )
+                    })}
+                    <button disabled={!state.want.length} onClick={() => suggest(sel.node.id)} className="ml-auto text-[11px] text-stone-400 hover:text-stone-800 disabled:opacity-40">New round</button>
                   </div>
                   {latest && (
-                    <BatchView key={latest.id} goTo={goTo} batch={latest} pending={pending[sel.node.id]} isThesis={!!isThesis} stale={latest.text !== sel.node.text.trim()} onAccept={accept} onUndo={undo} onDismiss={(b, i) => markItem(b.id, i.id, { status: "dismissed" })} />
+                    <BatchView key={latest.id} goTo={goTo} want={state.want} onMore={(t) => suggest(sel.node.id, [t])} batch={latest} pending={pending[sel.node.id]} isThesis={!!isThesis} stale={latest.text !== sel.node.text.trim()} onAccept={accept} onUndo={undo} onDismiss={(b, i) => markItem(b.id, i.id, { status: "dismissed" })} />
                   )}
                   <Steer
                     key={sel.node.id}
@@ -647,7 +678,7 @@ export default function Workspace() {
                           {earlier.map((b) => (
                             <div key={b.id} className="space-y-2 border-l border-stone-200 pl-3">
                               <p className="text-[11px] text-stone-400">For “{b.text.slice(0, 70)}{b.text.length > 70 ? "..." : ""}”</p>
-                              <BatchView batch={b} isThesis={!!isThesis} onAccept={accept} onUndo={undo} onDismiss={(bb, i) => markItem(bb.id, i.id, { status: "dismissed" })} />
+                              <BatchView batch={b} want={state.want} isThesis={!!isThesis} onAccept={accept} onUndo={undo} onDismiss={(bb, i) => markItem(bb.id, i.id, { status: "dismissed" })} />
                             </div>
                           ))}
                         </div>
@@ -679,23 +710,29 @@ export default function Workspace() {
 }
 
 function BatchView({
-  batch, pending, isThesis, stale, onAccept, onUndo, onDismiss, goTo,
+  batch, pending, isThesis, stale, onAccept, onUndo, onDismiss, goTo, want, onMore,
 }: {
   batch: Batch
+  want: SuggestionType[]
+  onMore?: (t: SuggestionType) => void
   goTo?: (label: string) => (() => void) | null
-  pending?: { ideas?: boolean; evidence?: boolean }
+  pending?: Partial<Record<SuggestionType, boolean>>
   isThesis: boolean
   stale?: boolean
   onAccept: (b: Batch, i: Suggestion, childIndex?: number) => void
   onUndo: (b: Batch, i: Suggestion) => void
   onDismiss: (b: Batch, i: Suggestion) => void
 }) {
-  const g = (type: SuggestionType, label: string, kind: "ideas" | "evidence" = "ideas") => ({
-    type, label, loading: pending?.[kind], error: type === "challenge" || type === "prose" || type === "revise" ? undefined : batch.errors[kind],
-  })
-  const groups = isThesis
-    ? [g("revise", "Reword"), g("extend", "Ways to build this"), g("evidence", "Opening hooks", "evidence"), g("challenge", "Push back")]
-    : [g("revise", "Reword"), g("prose", "Say it"), g("evidence", "Stories and examples", "evidence"), g("extend", "Next step"), g("challenge", "Push back")]
+  const labels: Record<SuggestionType, string> = {
+    revise: "Reword", prose: "Prose", evidence: "Research", extend: isThesis ? "Ways to build this" : "Build out", challenge: "Push back",
+  }
+  const groups = ALL_TYPES.filter((t) => want.includes(t)).map((type) => ({
+    type,
+    label: labels[type],
+    loading: pending?.[type],
+    error: type === "evidence" ? batch.errors.evidence : type === "revise" ? batch.errors.ideas : undefined,
+  }))
+  const ideasPending = !!pending && (["revise", "prose", "extend", "challenge"] as const).some((t) => pending[t])
   return (
     <div className="space-y-5">
       {batch.steer && <p className="text-[11px] text-stone-400">Steered by “{batch.steer}”</p>}
@@ -704,15 +741,22 @@ function BatchView({
         <BigPictureCard bp={batch.bigPicture} go={goTo?.(batch.bigPicture.nextLabel) ?? null} />
       ) : batch.perspective ? (
         <p className="text-[13px] italic leading-snug text-stone-500">{batch.perspective}</p>
-      ) : pending?.ideas ? (
+      ) : ideasPending ? (
         <Shimmer />
       ) : null}
       {groups.map((g) => {
         const items = batch.items.filter((i) => i.type === g.type && i.status !== "dismissed")
-        if (!g.loading && !items.length && !g.error) return null
+        if (!g.loading && !items.length && !g.error && !onMore) return null
         return (
           <section key={g.type}>
-            <p className="mb-1.5 text-[11px] font-medium uppercase tracking-wider text-stone-400">{g.label}</p>
+            <div className="mb-1.5 flex items-baseline justify-between">
+              <p className="text-[11px] font-medium uppercase tracking-wider text-stone-400">{g.label}</p>
+              {onMore && !g.loading && (
+                <button onClick={() => onMore(g.type)} className="text-[11px] text-stone-400 hover:text-stone-800">
+                  {items.length ? "More" : `Get ${g.label.toLowerCase()}`}
+                </button>
+              )}
+            </div>
             {g.loading && !items.length && <Shimmer label={g.type === "evidence" ? "searching the web" : undefined} />}
             {g.error && <p className="text-xs text-red-700">{g.error}</p>}
             <div className="space-y-0.5">

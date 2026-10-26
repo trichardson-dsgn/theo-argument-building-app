@@ -10,7 +10,10 @@ type Input = {
   guidance: string[] // author's notes for every suggestion
   previous: string[] // last round's suggestions, to avoid repeats
   shape: string // computed summary of the outline's structure
+  want: IdeaType[] // which kinds of suggestion the author asked for
 }
+type IdeaType = "revise" | "prose" | "extend" | "challenge"
+const IDEA_TYPES: IdeaType[] = ["revise", "prose", "extend", "challenge"]
 
 const SYSTEM = `You are a sharp thinking partner for someone developing a talk or essay. The human writes; you suggest. Be specific, concrete and brief. Never write the talk for them.
 Every suggestion has two voices:
@@ -44,6 +47,7 @@ function parseInput(body: unknown): Input | null {
     guidance: list(b.guidance, 12),
     previous: list(b.previous, 15),
     shape: typeof b.shape === "string" ? b.shape.slice(0, 600) : "",
+    want: Array.isArray(b.want) ? IDEA_TYPES.filter((t) => (b.want as unknown[]).includes(t)) : IDEA_TYPES,
   }
 }
 
@@ -88,27 +92,24 @@ const REVISE = (n: string) => `- "revise": ${n} rewrites of the focused text its
 const PROSE = (n: string) => `- "prose": ${n} short drafts (50-110 words) of what the author would actually SAY to justify or explain this point, in their voice and register: clear, concrete, one idea, the way they would actually say it in the talk. "title" names the approach (e.g. "Start from a familiar situation"), "statement" is the prose. Not a summary, not a list; do not invent facts or statistics.`
 
 async function ideas(key: string, i: Input) {
-  const task =
-    i.level === "thesis"
-      ? `Suggest:
-${PERSPECTIVE}
-${REVISE("1-2")}
-- "prose": []
-- "extend": 3 distinctly different ways this thesis could become a talk or post. Each has a "title" naming the angle, a one-sentence "detail", and 3-5 "children" key points in order. Each child is {"suggestion": advice to the author about what this point should do, "statement": the key point written as a declarative claim}. Account for any key points already written.
-- "challenge": 2-3 ways a skeptic would push back, or where the thesis is vague, too broad or unearned. "title" is the challenge, "detail" why it matters, "statement" a key point that would answer it.`
-      : i.depth === 1
-        ? `This is a key point (one level below the thesis). Suggest:
-${PERSPECTIVE}
-${REVISE("1-2")}
-${PROSE("2")}
-- "extend": 2 sub-points that would make this key point land harder: the best reason behind it, or a bridge into the next key point. Each has a "title" (advice), a one-sentence "detail", a "statement" (how it would read in the outline), and "children": [].
-- "challenge": 1 objection an audience member would actually raise, with "title", "detail" and a "statement" that answers it.`
-        : `This is a sub-point, ${i.depth} levels below the thesis. Help the author work out and say what they mean here rather than opening new sub-topics. Suggest:
-${PERSPECTIVE} If this point is a tangent, say so.
-${REVISE("1-2")}
-${PROSE("1-2")}
-- "extend": ${i.depth >= 3 ? "[] (already deep)" : "0-1 further step in the reasoning, only if it is genuinely missing"}. Each has a "title" (advice), a one-sentence "detail", a "statement", and "children": [].
-- "challenge": 1 if there is a real hole in the reasoning, otherwise [].`
+  // The author chooses which kinds of suggestion they want; only produce those.
+  const thesis = i.level === "thesis"
+  const wants = (t: IdeaType) => i.want.includes(t)
+  const parts = [
+    PERSPECTIVE,
+    wants("revise") ? REVISE("2") : `- "revise": []`,
+    wants("prose") ? PROSE("2") : `- "prose": []`,
+    !wants("extend")
+      ? `- "extend": []`
+      : thesis
+        ? `- "extend": 3 distinctly different ways this thesis could become a talk or post. Each has a "title" naming the angle, a one-sentence "detail", and 3-5 "children" key points in order. Each child is {"suggestion": advice to the author about what this point should do, "statement": the key point as it would read in the outline}. Account for any key points already written.`
+        : `- "extend": 2-3 points that could go beneath this one to build it out: the reason behind it, a step in the reasoning, or a bridge to the next point. Each has a "title" (advice), a one-sentence "detail", a "statement" (as it would read in the outline), and "children": [].`,
+    !wants("challenge")
+      ? `- "challenge": []`
+      : `- "challenge": ${thesis ? "2-3" : "1-2"} objections an audience member would actually raise, or holes in the reasoning. "title" is the challenge, "detail" why it matters, "statement" a point that would answer it.`,
+  ]
+  const where = thesis ? "This is the thesis." : i.depth === 1 ? "This is a key point." : `This is a sub-point, ${i.depth} levels below the thesis.`
+  const task = `${where} Suggest:\n${parts.join("\n")}`
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
@@ -128,8 +129,8 @@ ${PROSE("1-2")}
   if (!res.ok) throw new Error(`OpenAI request failed (${res.status})`)
   const data = await res.json()
   const parsed = JSON.parse(data.choices[0].message.content)
-  const map = (arr: unknown, type: "extend" | "challenge" | "revise" | "prose") =>
-    (Array.isArray(arr) ? arr : []).slice(0, 4).map((o: Record<string, unknown>) => {
+  const map = (arr: unknown, type: IdeaType) =>
+    (Array.isArray(arr) && i.want.includes(type) ? arr : []).slice(0, 4).map((o: Record<string, unknown>) => {
       const kids = (Array.isArray(o.children) ? o.children : []).slice(0, 6) as Record<string, unknown>[]
       return {
         type,
@@ -170,7 +171,7 @@ async function evidence(key: string, i: Input) {
       instructions: SYSTEM,
       input: `${context(i)}
 
-Search the web for ${i.level === "thesis" ? "2-3 real, specific opening hooks or" : i.depth === 1 ? "3 real, specific" : "1-2 real, quick"} things a speaker could use to make this ${i.level} land with a general audience: a story about a person or company, a well-known moment from history, sport, business or culture, a surprising fact, or a striking quote. Think of what makes a great talk or a widely shared article fun to consume, not a literature review. Avoid academic papers and jargon; if research matters, use one striking finding as reported by mainstream journalism. Pick things that fit this point's role and lead naturally into the next point.${i.depth >= 2 ? " This is a sub-point, so keep it light: one quick, clarifying example is enough." : ""} Only include items you actually found, each with its source URL. Never invent details or figures.
+Search the web for 3 real, specific ${i.level === "thesis" ? "pieces of evidence or opening hooks:" : ""} things a speaker could use to make this ${i.level} land with a general audience: a story about a person or company, a well-known moment from history, sport, business or culture, a surprising fact, or a striking quote. Think of what makes a great talk or a widely shared article fun to consume, not a literature review. Avoid academic papers and jargon; if research matters, use one striking finding as reported by mainstream journalism. Pick things that fit this point's role and lead naturally into the next point. Only include items you actually found, each with its source URL. Never invent details or figures.
 
 Reply with only JSON: {"items":[{"title":"short label","detail":"1-2 sentences to the author on why it is compelling and how to use it here","statement":"the story or fact as one clear, specific sentence for the outline, e.g. 'When Dr. Seuss was bet he could not write a book with only 50 words, he wrote Green Eggs and Ham.'","type":"story"|"example"|"surprising fact"|"quote","url":"source url","source":"publication or site name"}]}`,
     }),
