@@ -4,38 +4,34 @@ type Input = {
   kind: Kind
   level: "thesis" | "point"
   text: string
-  path: string[]
-  children: string[]
+  outline: string
 }
 
-const SYSTEM =
-  "You are a sharp thinking partner for someone developing a talk or essay. The human writes; you suggest. Be specific, concrete and brief. Never write the talk for them."
+const SYSTEM = `You are a sharp thinking partner for someone developing a talk or essay. The human writes; you suggest. Be specific, concrete and brief. Never write the talk for them.
+Every suggestion has two voices:
+- "title" and "detail" speak TO the author as advice (e.g. "Define what you mean by...", "Show a case where...").
+- "statement" is the text as it would appear IN their outline: a declarative claim written in the author's voice, never an instruction or a question.`
 
 function parseInput(body: unknown): Input | null {
   if (!body || typeof body !== "object") return null
   const b = body as Record<string, unknown>
   if (b.kind !== "ideas" && b.kind !== "evidence") return null
   if (typeof b.text !== "string" || !b.text.trim()) return null
-  const list = (v: unknown, n: number) =>
-    Array.isArray(v) ? v.map((x) => String(x).slice(0, 400)).slice(0, n) : []
   return {
     kind: b.kind,
     level: b.level === "thesis" ? "thesis" : "point",
     text: b.text.slice(0, 1500),
-    path: list(b.path, 6),
-    children: list(b.children, 12),
+    outline: typeof b.outline === "string" ? b.outline.slice(0, 10000) : "",
   }
 }
 
-function context(i: Input) {
-  return [
-    i.path.length ? `Thesis and parent points:\n${i.path.map((p, n) => `${"  ".repeat(n)}- ${p}`).join("\n")}` : "",
-    `${i.level === "thesis" ? "Thesis" : "Focused point"}: ${i.text}`,
-    i.children.length ? `Already written beneath it:\n${i.children.map((c) => `- ${c}`).join("\n")}` : "",
-  ]
-    .filter(Boolean)
-    .join("\n\n")
-}
+const context = (i: Input) =>
+  `The whole outline so far (indentation = altitude; the point marked >>> is the one to work on):
+${i.outline}
+
+${i.level === "thesis" ? "Thesis" : "Focused point"}: ${i.text}
+
+Use the whole outline: fit the focused point's role in the argument, build toward the thesis, connect with neighbouring points, and do not repeat what other points already cover.`
 
 function extractJson(text: string) {
   const start = text.indexOf("{")
@@ -58,11 +54,11 @@ async function ideas(key: string, i: Input) {
   const task =
     i.level === "thesis"
       ? `Suggest:
-- "extend": 3 distinctly different ways this thesis could become a talk or post. Each has a "title" naming the angle or structure, a one-sentence "detail", and 3-5 "children" key points in order.
-- "challenge": 3 ways a skeptic would push back, or where the thesis is vague, too broad or unearned. "title" is the challenge, "detail" says why it matters.`
+- "extend": 3 distinctly different ways this thesis could become a talk or post. Each has a "title" naming the angle, a one-sentence "detail", and 3-5 "children" key points in order. Each child is {"suggestion": advice to the author about what this point should do, "statement": the key point written as a declarative claim}. Account for any key points already written.
+- "challenge": 2-3 ways a skeptic would push back, or where the thesis is vague, too broad or unearned. "title" is the challenge, "detail" why it matters, "statement" a key point that would answer it.`
       : `Suggest:
-- "extend": 3-4 ways to develop this point (sub-points, reasons, implications, or a sharper version). Each has a "title" (the sub-point as it would read in the outline), a one-sentence "detail", and "children": [].
-- "challenge": 2-3 counterarguments, gaps or unclear claims in this point. "title" is the challenge, "detail" says why it matters.`
+- "extend": 2-3 ways to develop this point (a sub-argument, a reason, an implication). Each has a "title" (advice), a one-sentence "detail", a "statement" (the sub-point as a declarative claim), and "children": [].
+- "challenge": 1-2 counterarguments, gaps or unclear claims in this point given the rest of the argument. "title" is the challenge, "detail" why it matters, "statement" a sub-point that would answer it.`
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
@@ -74,7 +70,7 @@ async function ideas(key: string, i: Input) {
         { role: "system", content: SYSTEM },
         {
           role: "user",
-          content: `${context(i)}\n\n${task}\n\nReturn JSON: {"extend":[{"title","detail","children":[]}],"challenge":[{"title","detail"}]}`,
+          content: `${context(i)}\n\n${task}\n\nReturn JSON: {"extend":[{"title","detail","statement","children":[{"suggestion","statement"}]}],"challenge":[{"title","detail","statement"}]}`,
         },
       ],
     }),
@@ -83,13 +79,18 @@ async function ideas(key: string, i: Input) {
   const data = await res.json()
   const parsed = JSON.parse(data.choices[0].message.content)
   const map = (arr: unknown, type: "extend" | "challenge") =>
-    (Array.isArray(arr) ? arr : []).slice(0, 4).map((o: Record<string, unknown>) => ({
-      type,
-      title: str(o.title, 300),
-      detail: str(o.detail),
-      children: Array.isArray(o.children) ? o.children.map((c) => str(c, 300)).slice(0, 6) : [],
-      sourced: false,
-    }))
+    (Array.isArray(arr) ? arr : []).slice(0, 4).map((o: Record<string, unknown>) => {
+      const kids = (Array.isArray(o.children) ? o.children : []).slice(0, 6) as Record<string, unknown>[]
+      return {
+        type,
+        title: str(o.title, 300),
+        detail: str(o.detail),
+        statement: str(o.statement || o.title, 400),
+        children: kids.map((c) => str(c?.suggestion ?? c, 300)),
+        childStatements: kids.map((c) => str(c?.statement ?? c?.suggestion ?? c, 400)),
+        sourced: false,
+      }
+    })
   return [...map(parsed.extend, "extend"), ...map(parsed.challenge, "challenge")]
 }
 
@@ -104,9 +105,9 @@ async function evidence(key: string, i: Input) {
       instructions: SYSTEM,
       input: `${context(i)}
 
-Search the web for 3-4 real, specific items a speaker could use to make this ${i.level} compelling: concrete examples, memorable anecdotes or stories, studies, or data. Prefer vivid and credible over generic. Only include items you actually found, each with its source URL. Never invent figures.
+Search the web for 3-4 real, specific items that would make this ${i.level} compelling in the context of the whole argument: concrete examples, memorable anecdotes or stories, studies, or data. Pick evidence that supports this point's particular role and leads naturally into the next point. Prefer vivid and credible over generic. Only include items you actually found, each with its source URL. Never invent figures.
 
-Reply with only JSON: {"items":[{"title":"short label","detail":"1-2 sentences on what it shows and how to use it","type":"example"|"anecdote"|"study"|"data","url":"source url","source":"publication or site name"}]}`,
+Reply with only JSON: {"items":[{"title":"short label","detail":"1-2 sentences to the author on what it shows and how to use it here","statement":"the evidence as one declarative sentence for the outline, e.g. 'A 2019 Stanford study of 200 teams found...'","type":"example"|"anecdote"|"study"|"data","url":"source url","source":"publication or site name"}]}`,
     }),
   })
   if (!res.ok) throw new Error(`Web search failed (${res.status})`)
@@ -132,6 +133,7 @@ Reply with only JSON: {"items":[{"title":"short label","detail":"1-2 sentences o
       type: "evidence",
       title: str(o.title, 300),
       detail: str(o.detail),
+      statement: str(o.statement || o.title, 500),
       evidenceType: str(o.type, 20),
       children: [],
       url: valid ? url.replace(/[?&]utm_source=openai/, "") : "",

@@ -16,9 +16,11 @@ type SuggestionType = "extend" | "challenge" | "evidence"
 type Suggestion = {
   id: string
   type: SuggestionType
-  title: string
+  title: string // written to the author, shown in the panel
   detail: string
+  statement: string // written as a claim, inserted into the outline
   children: string[]
+  childStatements?: string[]
   url?: string
   source?: string
   evidenceType?: string
@@ -66,6 +68,12 @@ function parentOf(n: Node, id: string): Node | null {
 }
 const count = (n: Node): number => 1 + n.children.reduce((s, c) => s + count(c), 0)
 const hasEvidence = (n: Node): boolean => n.kind === "evidence" || !!n.source || n.children.some(hasEvidence)
+// Whole outline as indented text, with the focused point marked, so suggestions fit the full argument.
+const serialize = (n: Node, focusId: string, depth = 0): string =>
+  [
+    `${"  ".repeat(depth)}${n.id === focusId ? ">>> " : "- "}${depth === 0 ? "THESIS: " : n.kind === "evidence" ? "[evidence] " : ""}${n.text.trim() || "(empty)"}`,
+    ...n.children.filter((c) => c.text.trim()).map((c) => serialize(c, focusId, depth + 1)),
+  ].join("\n")
 // Flattened visible order, used for moving focus on Backspace.
 const flatten = (n: Node): Node[] => [n, ...n.children.flatMap(flatten)]
 
@@ -169,22 +177,26 @@ export default function Workspace() {
   const addChildren = (parentId: string, nodes: Node[]) =>
     setOutline((o) => update(o, parentId, (n) => ({ ...n, children: [...n.children, ...nodes] })))
 
-  async function suggest(nodeId: string) {
+  // The thesis gets structure and challenges; points below it also get web evidence.
+  async function suggest(nodeId: string, only?: ("ideas" | "evidence")[]) {
     const target = find(state!.outline, nodeId)
     if (!target || pendingRef.current[nodeId]) return
+    const kinds = only ?? (target.path.length === 1 ? (["ideas"] as const) : (["ideas", "evidence"] as const))
     const text = target.node.text.trim()
-    const batch: Batch = { id: uid(), nodeId, text, at: Date.now(), items: [], errors: {} }
-    setState((s) => (s ? { ...s, batches: [batch, ...s.batches] } : s))
-    setPending((p) => ({ ...p, [nodeId]: { ideas: true, evidence: true } }))
+    // A targeted request (e.g. evidence for the thesis) joins the current round instead of starting a new one.
+    const current = state!.batches.find((b) => b.nodeId === nodeId)
+    const reuse = only && current && current.text === text
+    const batch: Batch = reuse ? current : { id: uid(), nodeId, text, at: Date.now(), items: [], errors: {} }
+    if (!reuse) setState((s) => (s ? { ...s, batches: [batch, ...s.batches] } : s))
+    setPending((p) => ({ ...p, [nodeId]: Object.fromEntries(kinds.map((k) => [k, true])) }))
     setShowEarlier(false)
     const payload = {
       level: target.path.length === 1 ? "thesis" : "point",
       text,
-      path: target.path.slice(0, -1).map((n) => n.text),
-      children: target.node.children.map((c) => c.text),
+      outline: serialize(state!.outline, nodeId),
     }
     await Promise.all(
-      (["ideas", "evidence"] as const).map(async (kind) => {
+      kinds.map(async (kind) => {
         let items: Suggestion[] = []
         let error = ""
         try {
@@ -216,15 +228,15 @@ export default function Workspace() {
   function accept(batch: Batch, item: Suggestion, childIndex?: number) {
     if (!find(state!.outline, batch.nodeId)) return
     if (item.type === "evidence") {
-      addChildren(batch.nodeId, [mk(`${item.title}: ${item.detail}`, "evidence", "ai", item.url ?? "")])
+      addChildren(batch.nodeId, [mk(item.statement || item.title, "evidence", "ai", item.url ?? "")])
       markItem(batch.id, item.id, { status: "added" })
     } else if (item.children.length) {
       const indexes = childIndex === undefined ? item.children.map((_, i) => i).filter((i) => !item.addedChildren?.includes(i)) : [childIndex]
-      addChildren(batch.nodeId, indexes.map((i) => mk(item.children[i], "point", "ai")))
+      addChildren(batch.nodeId, indexes.map((i) => mk(item.childStatements?.[i] || item.children[i], "point", "ai")))
       const addedChildren = [...(item.addedChildren ?? []), ...indexes]
       markItem(batch.id, item.id, { addedChildren, status: addedChildren.length === item.children.length ? "added" : "new" })
     } else {
-      addChildren(batch.nodeId, [mk(item.title, "point", "ai")])
+      addChildren(batch.nodeId, [mk(item.statement || item.title, "point", "ai")])
       markItem(batch.id, item.id, { status: "added" })
     }
   }
@@ -402,9 +414,16 @@ export default function Workspace() {
                 <div className="flex items-center justify-between">
                   <p className="text-[11px] font-medium uppercase tracking-wider text-stone-500">{isThesis ? "On your thesis" : "On this point"}</p>
                   {sel.node.text.trim().length >= MIN_CHARS && (
-                    <button disabled={!!pending[sel.node.id]} onClick={() => suggest(sel.node.id)} className="text-xs text-stone-500 hover:text-stone-900 disabled:opacity-40">
-                      More ideas
-                    </button>
+                    <div className="flex gap-3">
+                      {isThesis && (
+                        <button disabled={!!pending[sel.node.id]} onClick={() => suggest(sel.node.id, ["evidence"])} className="text-xs text-stone-500 hover:text-stone-900 disabled:opacity-40">
+                          Find evidence
+                        </button>
+                      )}
+                      <button disabled={!!pending[sel.node.id]} onClick={() => suggest(sel.node.id)} className="text-xs text-stone-500 hover:text-stone-900 disabled:opacity-40">
+                        More ideas
+                      </button>
+                    </div>
                   )}
                 </div>
                 <p className="mt-1 line-clamp-3 font-serif text-[15px] text-stone-700">{sel.node.text || "Empty"}</p>
@@ -455,6 +474,8 @@ function BatchView({
     { type: "evidence", label: "Evidence from the web", hint: "Examples, anecdotes, studies", loading: pending?.evidence, error: batch.errors.evidence },
     { type: "challenge", label: "Challenges", hint: "What a skeptic would ask", loading: pending?.ideas, error: batch.errors.ideas },
   ]
+  // Below the thesis, evidence is the main job, so it leads.
+  if (!isThesis) groups.unshift(groups.splice(1, 1)[0])
   return (
     <div className="space-y-6">
       {stale && <p className="text-xs text-stone-400">You have edited since these were suggested.</p>}
