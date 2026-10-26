@@ -28,7 +28,7 @@ type Suggestion = {
   status: "new" | "added" | "dismissed"
   addedChildren?: number[]
 }
-type Batch = { id: string; nodeId: string; text: string; at: number; items: Suggestion[]; errors: Partial<Record<"ideas" | "evidence", string>> }
+type Batch = { id: string; nodeId: string; text: string; at: number; items: Suggestion[]; perspective?: string; errors: Partial<Record<"ideas" | "evidence", string>> }
 type Version = { id: string; label: string; at: number; outline: Node }
 type State = { outline: Node; batches: Batch[]; versions: Version[] }
 
@@ -110,7 +110,7 @@ export default function Workspace() {
   useEffect(() => {
     if (!state || !sel || viewing) return
     const text = sel.node.text.trim()
-    if (text.length < MIN_CHARS) return
+    if (text.length < MIN_CHARS || sel.node.kind === "evidence") return
     const last = state.batches.find((b) => b.nodeId === sel.node.id)
     if (last && last.text === text) return
     const t = setTimeout(() => suggest(sel.node.id), IDLE_MS)
@@ -181,7 +181,9 @@ export default function Workspace() {
   async function suggest(nodeId: string, only?: ("ideas" | "evidence")[]) {
     const target = find(state!.outline, nodeId)
     if (!target || pendingRef.current[nodeId]) return
-    const kinds = only ?? (target.path.length === 1 ? (["ideas"] as const) : (["ideas", "evidence"] as const))
+    const depth = target.path.length - 1
+    // Thesis: structure. Key points and their sub-points: ideas plus evidence. Deeper: tighten only.
+    const kinds = only ?? (depth === 0 || depth >= 3 ? (["ideas"] as const) : (["ideas", "evidence"] as const))
     const text = target.node.text.trim()
     // A targeted request (e.g. evidence for the thesis) joins the current round instead of starting a new one.
     const current = state!.batches.find((b) => b.nodeId === nodeId)
@@ -194,21 +196,24 @@ export default function Workspace() {
       level: target.path.length === 1 ? "thesis" : "point",
       text,
       outline: serialize(state!.outline, nodeId),
+      depth,
     }
     await Promise.all(
       kinds.map(async (kind) => {
         let items: Suggestion[] = []
+        let perspective = ""
         let error = ""
         try {
           const res = await fetch("/ai/suggest", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kind, ...payload }) })
           const data = await res.json()
           if (!res.ok) throw new Error(data.error || "Request failed")
+          perspective = data.perspective || ""
           items = data.items.map((i: Suggestion) => ({ ...i, id: uid(), status: "new" }))
         } catch (e) {
           error = e instanceof Error ? e.message : "Request failed"
         }
         setState((s) =>
-          s ? { ...s, batches: s.batches.map((b) => (b.id === batch.id ? { ...b, items: [...b.items, ...items], errors: { ...b.errors, ...(error ? { [kind]: error } : {}) } } : b)) } : s,
+          s ? { ...s, batches: s.batches.map((b) => (b.id === batch.id ? { ...b, items: [...b.items, ...items], ...(perspective ? { perspective } : {}), errors: { ...b.errors, ...(error ? { [kind]: error } : {}) } } : b)) } : s,
         )
         setPending((p) => ({ ...p, [nodeId]: { ...p[nodeId], [kind]: false } }))
       }),
@@ -470,8 +475,8 @@ function BatchView({
   onDismiss: (b: Batch, i: Suggestion) => void
 }) {
   const groups: { type: SuggestionType; label: string; hint: string; loading?: boolean; error?: string }[] = [
-    { type: "extend", label: isThesis ? "Ways to build this into a talk" : "Ways to develop this", hint: isThesis ? "Pick key points from any structure" : "Add as sub-points", loading: pending?.ideas, error: batch.errors.ideas },
-    { type: "evidence", label: "Evidence from the web", hint: "Examples, anecdotes, studies", loading: pending?.evidence, error: batch.errors.evidence },
+    { type: "extend", label: isThesis ? "Ways to build this into a talk" : "Ways to strengthen this", hint: isThesis ? "Pick key points from any structure" : "Sharpen, connect, tighten", loading: pending?.ideas, error: batch.errors.ideas },
+    { type: "evidence", label: "Evidence from the web", hint: "Stories, examples, surprising facts", loading: pending?.evidence, error: batch.errors.evidence },
     { type: "challenge", label: "Challenges", hint: "What a skeptic would ask", loading: pending?.ideas, error: batch.errors.ideas },
   ]
   // Below the thesis, evidence is the main job, so it leads.
@@ -479,6 +484,14 @@ function BatchView({
   return (
     <div className="space-y-6">
       {stale && <p className="text-xs text-stone-400">You have edited since these were suggested.</p>}
+      {batch.perspective ? (
+        <div className="rounded-lg bg-stone-100 px-3 py-2.5">
+          <p className="text-[11px] font-medium uppercase tracking-wider text-stone-500">Big picture</p>
+          <p className="mt-1 text-[13px] leading-snug text-stone-700">{batch.perspective}</p>
+        </div>
+      ) : pending?.ideas ? (
+        <Skeleton label="Stepping back..." />
+      ) : null}
       {groups.map((g) => {
         const items = batch.items.filter((i) => i.type === g.type && i.status !== "dismissed")
         if (!g.loading && !items.length && !g.error) return null

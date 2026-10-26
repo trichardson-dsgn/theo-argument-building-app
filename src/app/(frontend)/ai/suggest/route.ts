@@ -5,12 +5,14 @@ type Input = {
   level: "thesis" | "point"
   text: string
   outline: string
+  depth: number
 }
 
 const SYSTEM = `You are a sharp thinking partner for someone developing a talk or essay. The human writes; you suggest. Be specific, concrete and brief. Never write the talk for them.
 Every suggestion has two voices:
 - "title" and "detail" speak TO the author as advice (e.g. "Define what you mean by...", "Show a case where...").
-- "statement" is the text as it would appear IN their outline: a declarative claim written in the author's voice, never an instruction or a question.`
+- "statement" is the text as it would appear IN their outline: a declarative claim written in the author's voice, never an instruction or a question.
+Keep the big picture. A talk lives or dies on a clear thesis, a few strong key points, and memorable support. Favour sharpening, connecting and cutting over adding more depth. Write for a general audience: vivid, concrete, conversational, never academic.`
 
 function parseInput(body: unknown): Input | null {
   if (!body || typeof body !== "object") return null
@@ -22,6 +24,7 @@ function parseInput(body: unknown): Input | null {
     level: b.level === "thesis" ? "thesis" : "point",
     text: b.text.slice(0, 1500),
     outline: typeof b.outline === "string" ? b.outline.slice(0, 10000) : "",
+    depth: Math.max(0, Math.min(6, Number(b.depth) || 0)),
   }
 }
 
@@ -50,15 +53,24 @@ const norm = (u: string) => {
   }
 }
 
+const PERSPECTIVE = `- "perspective": one or two sentences stepping back from the focused point to the whole outline: does it still serve the thesis, is the argument drifting, is a key point missing, redundant or out of order? Be direct; say "On track" briefly if it is.`
+
 async function ideas(key: string, i: Input) {
   const task =
     i.level === "thesis"
       ? `Suggest:
+${PERSPECTIVE}
 - "extend": 3 distinctly different ways this thesis could become a talk or post. Each has a "title" naming the angle, a one-sentence "detail", and 3-5 "children" key points in order. Each child is {"suggestion": advice to the author about what this point should do, "statement": the key point written as a declarative claim}. Account for any key points already written.
 - "challenge": 2-3 ways a skeptic would push back, or where the thesis is vague, too broad or unearned. "title" is the challenge, "detail" why it matters, "statement" a key point that would answer it.`
-      : `Suggest:
-- "extend": 2-3 ways to develop this point (a sub-argument, a reason, an implication). Each has a "title" (advice), a one-sentence "detail", a "statement" (the sub-point as a declarative claim), and "children": [].
-- "challenge": 1-2 counterarguments, gaps or unclear claims in this point given the rest of the argument. "title" is the challenge, "detail" why it matters, "statement" a sub-point that would answer it.`
+      : i.depth === 1
+        ? `This is a key point (one level below the thesis). Suggest:
+${PERSPECTIVE}
+- "extend": 2-3 ways to make this key point land harder for the thesis: a sharper wording, the single best reason behind it, or a bridge into the next key point. Each has a "title" (advice), a one-sentence "detail", a "statement" (how it would read in the outline), and "children": [].
+- "challenge": 1 objection an audience member would actually raise, with "title", "detail" and a "statement" that answers it.`
+        : `This point is already ${i.depth} levels below the thesis. Do NOT go deeper or open new sub-topics. Suggest:
+${PERSPECTIVE} If this point is a tangent, say so.
+- "extend": 1-2 ways to tighten it or tie it back to its parent point and the thesis. Each has a "title" (advice), a one-sentence "detail", a "statement" (the tightened point), and "children": [].
+- "challenge": [] unless the point actively undermines the argument.`
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
@@ -70,7 +82,7 @@ async function ideas(key: string, i: Input) {
         { role: "system", content: SYSTEM },
         {
           role: "user",
-          content: `${context(i)}\n\n${task}\n\nReturn JSON: {"extend":[{"title","detail","statement","children":[{"suggestion","statement"}]}],"challenge":[{"title","detail","statement"}]}`,
+          content: `${context(i)}\n\n${task}\n\nReturn JSON: {"perspective":string,"extend":[{"title","detail","statement","children":[{"suggestion","statement"}]}],"challenge":[{"title","detail","statement"}]}`,
         },
       ],
     }),
@@ -91,7 +103,10 @@ async function ideas(key: string, i: Input) {
         sourced: false,
       }
     })
-  return [...map(parsed.extend, "extend"), ...map(parsed.challenge, "challenge")]
+  return {
+    perspective: str(parsed.perspective, 400),
+    items: [...map(parsed.extend, "extend"), ...map(parsed.challenge, "challenge")],
+  }
 }
 
 async function evidence(key: string, i: Input) {
@@ -105,9 +120,9 @@ async function evidence(key: string, i: Input) {
       instructions: SYSTEM,
       input: `${context(i)}
 
-Search the web for 3-4 real, specific items that would make this ${i.level} compelling in the context of the whole argument: concrete examples, memorable anecdotes or stories, studies, or data. Pick evidence that supports this point's particular role and leads naturally into the next point. Prefer vivid and credible over generic. Only include items you actually found, each with its source URL. Never invent figures.
+Search the web for 3-4 real, specific things a speaker could use to make this ${i.level} land with a general audience: a story about a person or company, a well-known moment from history, sport, business or culture, a surprising fact, or a striking quote. Think of what makes a great talk or a widely shared article fun to consume, not a literature review. Avoid academic papers and jargon; if research matters, use one striking finding as reported by mainstream journalism. Pick things that fit this point's role and lead naturally into the next point. Only include items you actually found, each with its source URL. Never invent details or figures.
 
-Reply with only JSON: {"items":[{"title":"short label","detail":"1-2 sentences to the author on what it shows and how to use it here","statement":"the evidence as one declarative sentence for the outline, e.g. 'A 2019 Stanford study of 200 teams found...'","type":"example"|"anecdote"|"study"|"data","url":"source url","source":"publication or site name"}]}`,
+Reply with only JSON: {"items":[{"title":"short label","detail":"1-2 sentences to the author on why it is compelling and how to use it here","statement":"the story or fact as one vivid, conversational sentence for the outline, e.g. 'When Dr. Seuss was bet he could not write a book with only 50 words, he wrote Green Eggs and Ham.'","type":"story"|"example"|"surprising fact"|"quote","url":"source url","source":"publication or site name"}]}`,
     }),
   })
   if (!res.ok) throw new Error(`Web search failed (${res.status})`)
@@ -126,7 +141,7 @@ Reply with only JSON: {"items":[{"title":"short label","detail":"1-2 sentences t
     }
   }
   const parsed = extractJson(text)
-  return (Array.isArray(parsed.items) ? parsed.items : []).slice(0, 5).map((o: Record<string, unknown>) => {
+  const items = (Array.isArray(parsed.items) ? parsed.items : []).slice(0, 5).map((o: Record<string, unknown>) => {
     const url = str(o.url, 800)
     const valid = /^https?:\/\//.test(url)
     return {
@@ -142,6 +157,7 @@ Reply with only JSON: {"items":[{"title":"short label","detail":"1-2 sentences t
       sourced: valid && cited.has(norm(url)),
     }
   })
+  return { perspective: "", items }
 }
 
 export async function POST(request: Request) {
@@ -150,8 +166,7 @@ export async function POST(request: Request) {
   const input = parseInput(await request.json().catch(() => null))
   if (!input) return Response.json({ error: "Invalid request." }, { status: 400 })
   try {
-    const items = input.kind === "ideas" ? await ideas(key, input) : await evidence(key, input)
-    return Response.json({ items })
+    return Response.json(input.kind === "ideas" ? await ideas(key, input) : await evidence(key, input))
   } catch (e) {
     return Response.json({ error: e instanceof Error ? e.message : "Request failed" }, { status: 502 })
   }
