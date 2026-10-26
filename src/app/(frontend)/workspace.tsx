@@ -32,7 +32,7 @@ type Batch = { id: string; nodeId: string; text: string; at: number; items: Sugg
 type Version = { id: string; label: string; at: number; outline: Node }
 // feedback: remembered steering notes per point; guidance: notes that apply to every suggestion.
 type State = { outline: Node; batches: Batch[]; versions: Version[]; feedback: Record<string, string[]>; guidance: string[] }
-type DropPos = "before" | "after" | "inside"
+type DropPos = "before" | "after" | "inside" // used by keyboard indent/outdent
 
 const uid = () => Math.random().toString(36).slice(2, 10)
 const mk = (text: string, kind: Kind = "point", origin: Node["origin"] = "human", source = ""): Node => ({
@@ -76,6 +76,27 @@ const serialize = (n: Node, focusId: string, depth = 0): string =>
     ...n.children.filter((c) => c.text.trim()).map((c) => serialize(c, focusId, depth + 1)),
   ].join("\n")
 const flatten = (n: Node): Node[] => [n, ...n.children.flatMap(flatten)]
+// Drop into the gap after row `afterId`, at outline depth `depth`: one deeper makes it the first
+// child of that row; equal or shallower places it after that row's ancestor at that depth.
+function placeAt(o: Node, id: string, afterId: string, depth: number): Node {
+  const dragged = find(o, id)?.node
+  if (!dragged || find(dragged, afterId)) return o
+  const rest = removeNode(o, id)
+  const anchor = find(rest, afterId)
+  if (!anchor) return o
+  const anchorDepth = anchor.path.length - 1
+  if (depth === anchorDepth + 1) return update(rest, afterId, (n) => ({ ...n, children: [dragged, ...n.children] }))
+  const sibling = anchor.path[depth]
+  const parent = anchor.path[depth - 1]
+  if (!sibling || !parent) return o
+  return update(rest, parent.id, (n) => {
+    const children = [...n.children]
+    children.splice(children.findIndex((c) => c.id === sibling.id) + 1, 0, dragged)
+    return { ...n, children }
+  })
+}
+const INDENT = 22 // px per nesting level: ml-[9px] + border + pl-3
+
 function moveNode(o: Node, id: string, targetId: string, pos: DropPos): Node {
   const dragged = find(o, id)?.node
   if (!dragged || id === targetId || find(dragged, targetId)) return o
@@ -101,7 +122,8 @@ export default function Workspace() {
   const [showEarlier, setShowEarlier] = useState(false)
   const [showVersions, setShowVersions] = useState(false)
   const [drag, setDrag] = useState<string | null>(null)
-  const [drop, setDrop] = useState<{ id: string; pos: DropPos } | null>(null)
+  const [drop, setDrop] = useState<{ afterId: string; depth: number; parentId: string; top: number; left: number } | null>(null)
+  const outlineRef = useRef<HTMLDivElement>(null)
   const focusNext = useRef<string | null>(null)
   const pendingRef = useRef(pending)
   pendingRef.current = pending
@@ -336,13 +358,43 @@ export default function Workspace() {
     setState((s) => (s ? { ...s, versions: [{ id: uid(), label, at: Date.now(), outline: structuredClone(s.outline) }, ...s.versions] } : s))
   }
 
-  function onDragOver(e: React.DragEvent, n: Node, depth: number) {
-    if (!drag || drag === n.id || find(find(state!.outline, drag)!.node, n.id)) return
+  // Visible rows in order, excluding the subtree being dragged.
+  function visibleRows() {
+    const rows: { node: Node; depth: number; path: Node[] }[] = []
+    const walk = (n: Node, depth: number, path: Node[]) => {
+      if (n.id === drag) return
+      rows.push({ node: n, depth, path: [...path, n] })
+      if (depth < alt.depth) n.children.forEach((c) => walk(c, depth + 1, [...path, n]))
+    }
+    walk(state!.outline, 0, [])
+    return rows
+  }
+  function onDragOver(e: React.DragEvent, overId: string | null) {
+    if (!drag || !outlineRef.current) return
     e.preventDefault()
-    const r = e.currentTarget.getBoundingClientRect()
-    const y = (e.clientY - r.top) / r.height
-    const pos: DropPos = depth === 0 ? "inside" : y < 0.3 ? "before" : y > 0.7 ? "after" : "inside"
-    if (drop?.id !== n.id || drop.pos !== pos) setDrop({ id: n.id, pos })
+    e.stopPropagation()
+    const rows = visibleRows()
+    let gap = rows.length - 1
+    if (overId) {
+      const i = rows.findIndex((r) => r.node.id === overId)
+      if (i < 0) return // hovering the dragged item itself
+      const rect = e.currentTarget.getBoundingClientRect()
+      gap = Math.max(0, e.clientY < rect.top + rect.height / 2 ? i - 1 : i)
+    }
+    const anchor = rows[gap]
+    const next = rows[gap + 1]
+    const maxDepth = anchor.depth + 1
+    const minDepth = Math.max(1, next ? next.depth : 1)
+    const box = outlineRef.current.getBoundingClientRect()
+    const anchorRect = rowRefs.current[anchor.node.id]!.getBoundingClientRect()
+    // Depth 0 and 1 rows share a left edge; each level after that is indented by INDENT.
+    const baseLeft = anchorRect.left - box.left - Math.max(0, anchor.depth - 1) * INDENT
+    const wanted = Math.round((e.clientX - box.left - baseLeft - 18) / INDENT) + 1
+    const depth = Math.max(minDepth, Math.min(maxDepth, wanted))
+    const parentId = depth === anchor.depth + 1 ? anchor.node.id : anchor.path[depth - 1].id
+    const top = anchorRect.bottom - box.top
+    const left = baseLeft + (depth - 1) * INDENT + 8
+    if (drop?.afterId !== anchor.node.id || drop.depth !== depth || drop.top !== top) setDrop({ afterId: anchor.node.id, depth, parentId, top, left })
   }
   function endDrag() {
     setDrag(null)
@@ -354,23 +406,15 @@ export default function Workspace() {
     const isSel = selected === n.id && !readOnly
     const hiddenCount = depth === alt.depth ? count(n) - 1 : 0
     const thinking = pending[n.id]
-    const dropHere = drop?.id === n.id ? drop.pos : null
+    const isDropParent = drop?.parentId === n.id
     const dot = n.kind === "evidence" ? (n.source ? "bg-sky-600" : "bg-amber-400") : n.origin === "ai" ? "bg-amber-400" : "bg-stone-400"
     return (
       <li key={n.id} className={drag === n.id ? "opacity-40" : ""}>
         <div
           ref={(el) => { rowRefs.current[n.id] = el }}
-          onDragOver={(e) => !readOnly && onDragOver(e, n, depth)}
-          onDragLeave={() => dropHere && setDrop(null)}
-          onDrop={(e) => {
-            e.preventDefault()
-            if (drag && drop) setOutline((o) => moveNode(o, drag, drop.id, drop.pos))
-            endDrag()
-          }}
-          className={`group relative -mx-2 flex items-start gap-1 rounded-lg py-0.5 pl-2 pr-2 transition-colors ${dropHere === "inside" ? "bg-sky-50 ring-1 ring-sky-300" : isSel && !viewing ? "bg-white/80 shadow-[0_0_0_1px_rgb(231,229,228)]" : ""}`}
+          onDragOver={(e) => !readOnly && onDragOver(e, n.id)}
+          className={`group relative -mx-2 flex items-start gap-1 rounded-lg py-0.5 pl-2 pr-2 transition-colors ${isDropParent ? "bg-sky-50" : isSel && !viewing ? "bg-white/80 shadow-[0_0_0_1px_rgb(231,229,228)]" : ""}`}
         >
-          {dropHere === "before" && <span className="absolute -top-px left-6 right-0 h-0.5 rounded bg-sky-500" />}
-          {dropHere === "after" && <span className="absolute -bottom-px left-6 right-0 h-0.5 rounded bg-sky-500" />}
           {depth > 0 && (
             <span
               draggable={!readOnly}
@@ -491,7 +535,24 @@ export default function Workspace() {
       )}
 
       <div className="relative mx-auto flex max-w-[1180px] gap-12 px-10 pb-[50vh] pt-24">
-        <ul className="min-w-0 max-w-[660px] flex-1">{renderNode(outline, 0, !!viewing)}</ul>
+        <div
+          ref={outlineRef}
+          className="relative min-w-0 max-w-[660px] flex-1"
+          onDragOver={(e) => onDragOver(e, null)}
+          onDrop={(e) => {
+            e.preventDefault()
+            if (drag && drop) setOutline((o) => placeAt(o, drag, drop.afterId, drop.depth))
+            endDrag()
+          }}
+        >
+          <ul>{renderNode(outline, 0, !!viewing)}</ul>
+          {drop && (
+            <div className="pointer-events-none absolute right-0 z-10 flex items-center" style={{ top: drop.top - 3, left: drop.left }}>
+              <span className="h-[7px] w-[7px] shrink-0 rounded-full border-[1.5px] border-sky-500 bg-[#f7f5f0]" />
+              <span className="h-0.5 flex-1 rounded bg-sky-500" />
+            </div>
+          )}
+        </div>
 
         <div className="w-[360px] shrink-0">
           {sel && !viewing && (
