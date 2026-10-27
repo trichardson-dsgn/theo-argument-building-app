@@ -335,8 +335,15 @@ export default function Workspace() {
         let error = ""
         try {
           const res = await fetch("/ai/suggest", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kind, want: ts, ...payload }) })
-          const data = await res.json()
-          if (!res.ok) throw new Error(data.error || "Request failed")
+          // The preview proxy can answer with plain text (e.g. "Unauthorized") when its session expires.
+          const raw = await res.text()
+          let data: { error?: string; items?: Suggestion[]; bigPicture?: BigPicture } = {}
+          try {
+            data = JSON.parse(raw)
+          } catch {
+            throw new Error(res.status === 401 || res.status === 403 ? "Session expired. Reload the page to reconnect; your writing is saved." : `Request failed (${res.status})`)
+          }
+          if (!res.ok || !data.items) throw new Error(data.error || "Request failed")
           bigPicture = data.bigPicture || null
           items = data.items.map((i: Suggestion) => ({ ...i, id: uid(), status: "new" }))
         } catch (e) {
@@ -726,11 +733,13 @@ function BatchView({
   const labels: Record<SuggestionType, string> = {
     revise: "Reword", prose: "Prose", evidence: "Research", extend: isThesis ? "Ways to build this" : "Build out", challenge: "Push back",
   }
+  // Errors from the shared ideas request show under the first visible non-research group.
+  const firstIdea = ALL_TYPES.find((t) => t !== "evidence" && want.includes(t))
   const groups = ALL_TYPES.filter((t) => want.includes(t)).map((type) => ({
     type,
     label: labels[type],
     loading: pending?.[type],
-    error: type === "evidence" ? batch.errors.evidence : type === "revise" ? batch.errors.ideas : undefined,
+    error: type === "evidence" ? batch.errors.evidence : type === firstIdea ? batch.errors.ideas : undefined,
   }))
   const ideasPending = !!pending && (["revise", "prose", "extend", "challenge"] as const).some((t) => pending[t])
   return (
