@@ -1,1 +1,10 @@
-{}
+{
+  "description": "Develop talks and writing in an AI-assisted workspace with an editable nested outline, supporting arguments, examples, and prose—all organized in one evolving artifact.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
